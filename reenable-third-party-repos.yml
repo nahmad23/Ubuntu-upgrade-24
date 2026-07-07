@@ -1,0 +1,143 @@
+---
+# =============================================================================
+# Playbook : reenable-third-party-repos.yml
+# Purpose  : After a 22.04 -> 24.04 release upgrade, do-release-upgrade
+#            disables every third-party APT source (PPAs, Docker, Grafana,
+#            HashiCorp, ...). This playbook:
+#
+#              1. Finds sources the upgrader disabled, in both classic
+#                 one-line format (*.list, commented out with a
+#                 "# disabled on upgrade to noble" marker) and deb822
+#                 format (*.sources, set to "Enabled: no").
+#              2. Re-enables them.
+#              3. Rewrites the suite "jammy" -> "noble" (repos that use a
+#                 fixed suite like "stable" are left untouched).
+#              4. Runs apt-get update and reports any repository that does
+#                 not serve noble yet, so you can deal with those by hand.
+#
+# Usage    : ansible-playbook reenable-third-party-repos.yml
+#            ansible-playbook reenable-third-party-repos.yml -e rewrite_codename=false
+# =============================================================================
+
+- name: Re-enable third-party APT repositories after upgrade to Ubuntu 24.04
+  hosts: ubuntu_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    old_codename: jammy
+    new_codename: noble
+    rewrite_codename: true     # set false to re-enable without touching suites
+
+  tasks:
+
+    - name: Abort if host is not running Ubuntu 24.04
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version is version('24.04', '>=')
+        fail_msg: >-
+          Host reports {{ ansible_distribution }}
+          {{ ansible_distribution_version }} — run the upgrade playbook first.
+
+    # -------------------------------------------------------------------
+    # Classic one-line sources (*.list) — the upgrader comments the line
+    # out and appends "# disabled on upgrade to noble".
+    # -------------------------------------------------------------------
+    - name: Find .list files disabled by the release upgrader
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: '*.list'
+        contains: '.*# disabled on upgrade to.*'
+      register: disabled_list_files
+
+    - name: Re-enable commented-out entries in .list files
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '^#\s*(deb(?:-src)?\s+[^#\n]*?)\s*#\s*disabled on upgrade to\s+\S+\s*$'
+        replace: '\1'
+      loop: "{{ disabled_list_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # -------------------------------------------------------------------
+    # deb822 sources (*.sources) — the upgrader flips "Enabled: yes" to
+    # "Enabled: no" and leaves a disabled-on-upgrade comment.
+    # -------------------------------------------------------------------
+    - name: Find .sources files disabled by the release upgrader
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: '*.sources'
+        contains: '(?i).*disabled on upgrade.*'
+      register: disabled_sources_files
+
+    - name: Re-enable deb822 sources
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '^Enabled:\s*no\s*$'
+        replace: 'Enabled: yes'
+      loop: "{{ disabled_sources_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Drop the upgrader's "disabled on upgrade" marker comments
+      ansible.builtin.lineinfile:
+        path: "{{ item.path }}"
+        regexp: '^#.*[Dd]isabled on upgrade.*$'
+        state: absent
+      loop: "{{ disabled_sources_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # -------------------------------------------------------------------
+    # Point the re-enabled repos at noble
+    # -------------------------------------------------------------------
+    - name: Rewrite suite {{ old_codename }} -> {{ new_codename }} in re-enabled files
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '\b{{ old_codename }}\b'
+        replace: '{{ new_codename }}'
+      loop: "{{ disabled_list_files.files + disabled_sources_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: rewrite_codename | bool
+
+    - name: Show what was re-enabled on this host
+      ansible.builtin.debug:
+        msg: >-
+          Re-enabled
+          {{ (disabled_list_files.files + disabled_sources_files.files)
+             | map(attribute='path') | list
+             | default(['nothing — no disabled sources found'], true) }}
+
+    # -------------------------------------------------------------------
+    # Verify every repository actually serves noble
+    # -------------------------------------------------------------------
+    - name: Refresh apt cache against the re-enabled repositories
+      ansible.builtin.command: apt-get update
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: apt_update
+      changed_when: true
+      failed_when: false
+
+    - name: Collect repositories that failed to update
+      ansible.builtin.set_fact:
+        failed_repos: >-
+          {{ (apt_update.stdout_lines + apt_update.stderr_lines)
+             | select('search', '^(Err:|E: The repository)') | list }}
+
+    - name: Warn about repositories that do not serve {{ new_codename }} yet
+      ansible.builtin.fail:
+        msg: |
+          apt-get update reported problems on {{ inventory_hostname }}.
+          These repositories likely do not publish {{ new_codename }} packages
+          yet — fix or remove them manually in /etc/apt/sources.list.d/:
+          {{ failed_repos | join('\n') }}
+      when: apt_update.rc != 0 or failed_repos | length > 0
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: >-
+          All APT repositories on {{ inventory_hostname }} are enabled and
+          resolving for {{ new_codename }}.

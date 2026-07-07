@@ -7,9 +7,10 @@ stage**.
 ## Repository layout
 
 ```
-├── ansible.cfg                    # SSH keepalives, logging, forks
-├── inventory/hosts.ini            # Your server list (edit this)
-├── upgrade-ubuntu-22-to-24.yml    # The upgrade playbook
+├── ansible.cfg                        # SSH keepalives, logging, forks
+├── inventory/hosts.ini                # Your server list (edit this)
+├── upgrade-ubuntu-22-to-24.yml        # Step 1: the upgrade playbook
+├── reenable-third-party-repos.yml     # Step 2: restore PPAs/vendor repos
 └── README.md
 ```
 
@@ -65,11 +66,26 @@ ansible-playbook upgrade-ubuntu-22-to-24.yml --limit server01.example.com,server
 4. **Check `ansible-upgrade.log`** (written by `ansible.cfg`) and, on any
    failed host, `/var/log/dist-upgrade/` for the upgrader's own logs.
 
-## Important notes / caveats
+## Step 2: Re-enable third-party repositories
 
-- **Third-party APT repos (PPAs, Docker, etc.) are disabled** by
-  `do-release-upgrade` during the upgrade. Re-enable them for `noble`
-  afterwards (entries in `/etc/apt/sources.list.d/` will be commented out).
+`do-release-upgrade` disables every third-party APT source (PPAs, Docker,
+Grafana, HashiCorp, …) during the upgrade. Once a host is on 24.04, run:
+
+```bash
+# Same batching/--limit options apply
+ansible-playbook reenable-third-party-repos.yml
+```
+
+It finds everything the upgrader disabled in `/etc/apt/sources.list.d/`
+(both classic `.list` files and deb822 `.sources` files), re-enables the
+entries, rewrites the suite `jammy` → `noble`, then runs `apt-get update`
+and **fails the host with a list of any repository that doesn't publish
+`noble` packages yet** so you can handle those few by hand. Repos that use
+a fixed suite (e.g. Google Chrome's `stable`) are re-enabled but not
+rewritten. Use `-e rewrite_codename=false` if you want to re-enable
+without touching suites at all.
+
+## Important notes / caveats
 - **Runtime**: expect 30–90 minutes per server depending on package count,
   disk, and network. The playbook allows up to 2 h per host
   (`release_upgrade_timeout`) before giving up.
