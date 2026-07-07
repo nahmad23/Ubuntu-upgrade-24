@@ -1,0 +1,193 @@
+---
+# =============================================================================
+# Playbook : upgrade-ubuntu-22-to-24.yml
+# Purpose  : Fully unattended in-place upgrade of Ubuntu 22.04 LTS (Jammy)
+#            to Ubuntu 24.04 LTS (Noble) across a fleet of servers.
+#
+# Usage    : ansible-playbook -i inventory/hosts.ini upgrade-ubuntu-22-to-24.yml
+#
+# Batching : Upgrades run in rolling batches (default 10% of the fleet at a
+#            time). Override at runtime:
+#              ansible-playbook ... -e upgrade_batch=5
+#              ansible-playbook ... -e upgrade_batch=25%
+# =============================================================================
+
+- name: Upgrade Ubuntu 22.04 LTS to 24.04 LTS (unattended)
+  hosts: ubuntu_servers
+  become: true
+  serial: "{{ upgrade_batch | default('10%') }}"
+  max_fail_percentage: "{{ max_fail_pct | default(20) }}"
+  gather_facts: true
+
+  vars:
+    required_free_space_mb: 10240        # 10 GB free on / before we start
+    dist_upgrade_timeout: 3600           # 1 hour for the pre-upgrade dist-upgrade
+    release_upgrade_timeout: 7200        # 2 hours for do-release-upgrade
+    reboot_timeout: 1200                 # 20 min for the post-upgrade reboot
+    apt_noninteractive_env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a                # auto-restart services, never prompt
+      APT_LISTCHANGES_FRONTEND: none
+
+  pre_tasks:
+
+    # -------------------------------------------------------------------
+    # PRE-FLIGHT CHECKS
+    # -------------------------------------------------------------------
+    - name: Skip hosts that are already on Ubuntu 24.04
+      ansible.builtin.meta: end_host
+      when:
+        - ansible_distribution == 'Ubuntu'
+        - ansible_distribution_version is version('24.04', '>=')
+
+    - name: Abort if host is not Ubuntu 22.04
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version is version('22.04', '==')
+        fail_msg: >-
+          Host is {{ ansible_distribution }} {{ ansible_distribution_version }},
+          expected Ubuntu 22.04. Refusing to upgrade.
+
+    - name: Check free disk space on /
+      ansible.builtin.assert:
+        that:
+          - (item.size_available / 1024 / 1024) | int > required_free_space_mb
+        fail_msg: >-
+          Only {{ (item.size_available / 1024 / 1024) | int }} MB free on /,
+          need at least {{ required_free_space_mb }} MB.
+      loop: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | list }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+    - name: Verify the Ubuntu archive is reachable
+      ansible.builtin.uri:
+        url: http://archive.ubuntu.com/ubuntu/dists/noble/Release
+        method: HEAD
+        timeout: 15
+
+  tasks:
+
+    # -------------------------------------------------------------------
+    # STEP 1 — Bring 22.04 fully up to date first (required by the
+    #          release upgrader) and reboot if a new kernel landed.
+    # -------------------------------------------------------------------
+    - name: Wait for any running apt/dpkg operations to finish
+      ansible.builtin.shell: >-
+        while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock
+        >/dev/null 2>&1; do sleep 5; done
+      changed_when: false
+      async: 600
+      poll: 10
+
+    - name: Update apt cache and apply all pending 22.04 updates
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        autoremove: true
+        autoclean: true
+        dpkg_options: 'force-confdef,force-confold'
+      environment: "{{ apt_noninteractive_env }}"
+      async: "{{ dist_upgrade_timeout }}"
+      poll: 30
+
+    - name: Check whether a reboot is required before the release upgrade
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_pre
+
+    - name: Reboot to load the latest 22.04 kernel
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Rebooting before Ubuntu release upgrade (Ansible)"
+      when: reboot_required_pre.stat.exists
+
+    # -------------------------------------------------------------------
+    # STEP 2 — Prepare the release upgrader for unattended operation
+    # -------------------------------------------------------------------
+    - name: Ensure update-manager-core is installed
+      ansible.builtin.apt:
+        name: update-manager-core
+        state: present
+      environment: "{{ apt_noninteractive_env }}"
+
+    - name: Allow upgrades to the next LTS release (Prompt=lts)
+      ansible.builtin.lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    - name: Remove any stale release-upgrader lock/state from failed runs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/update-manager/meta-release-lts
+        - /var/lib/ubuntu-release-upgrader/release-upgrade-available
+
+    # -------------------------------------------------------------------
+    # STEP 3 — Run the release upgrade completely non-interactively.
+    #          DistUpgradeViewNonInteractive answers every prompt with
+    #          the default and keeps existing config files (confold).
+    # -------------------------------------------------------------------
+    - name: Run do-release-upgrade (non-interactive, this takes 30-90 min)
+      ansible.builtin.command:
+        cmd: do-release-upgrade -f DistUpgradeViewNonInteractive
+      environment: "{{ apt_noninteractive_env }}"
+      async: "{{ release_upgrade_timeout }}"
+      poll: 60
+      register: release_upgrade
+      failed_when:
+        - release_upgrade.rc is defined
+        - release_upgrade.rc != 0
+
+    # -------------------------------------------------------------------
+    # STEP 4 — Reboot into 24.04 and verify
+    # -------------------------------------------------------------------
+    - name: Reboot into Ubuntu 24.04
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Rebooting to complete Ubuntu 24.04 upgrade (Ansible)"
+
+    - name: Re-gather facts after the upgrade
+      ansible.builtin.setup:
+
+    - name: Verify the host is now running Ubuntu 24.04
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution_version is version('24.04', '>=')
+        fail_msg: >-
+          Upgrade appears to have failed — host still reports
+          {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          Check /var/log/dist-upgrade/ on the host.
+        success_msg: >-
+          Host successfully upgraded to
+          {{ ansible_distribution }} {{ ansible_distribution_version }}.
+
+    # -------------------------------------------------------------------
+    # STEP 5 — Post-upgrade cleanup
+    # -------------------------------------------------------------------
+    - name: Remove packages left over from the old release
+      ansible.builtin.apt:
+        update_cache: true
+        autoremove: true
+        autoclean: true
+        purge: true
+      environment: "{{ apt_noninteractive_env }}"
+
+    - name: Check whether a final reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_post
+
+    - name: Final reboot if cleanup requires it
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+      when: reboot_required_post.stat.exists
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} upgraded to
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+          (kernel {{ ansible_kernel }})
