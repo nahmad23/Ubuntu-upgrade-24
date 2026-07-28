@@ -1,0 +1,5 @@
+2026-07-28 18:52:05,406 p=4835 u=root n=ansible INFO| playbook: upgrade-ubuntu-22-to-24.yml
+2026-07-28 18:52:05,940 p=4838 u=root n=ansible INFO| playbook: reenable-third-party-repos.yml
+2026-07-28 18:56:26,248 p=5567 u=root n=ansible INFO| playbook: upgrade-ubuntu-22-to-24.yml
+2026-07-28 19:15:12,094 p=4830 u=root n=ansible INFO| playbook: upgrade-ubuntu-22-to-24.yml
+2026-07-28 19:15:12,760 p=4834 u=root n=ansible INFO| playbook: reenable-third-party-repos.yml
