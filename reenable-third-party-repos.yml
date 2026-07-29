@@ -9,25 +9,37 @@
 #                 one-line format (*.list, commented out with a
 #                 "# disabled on upgrade to noble" marker) and deb822
 #                 format (*.sources, set to "Enabled: no").
-#              2. Re-enables them.
+#              2. Re-enables them (keeping a .bak of every file it edits).
 #              3. Rewrites the suite "jammy" -> "noble" (repos that use a
-#                 fixed suite like "stable" are left untouched).
+#                 fixed suite like "stable" are left untouched, and so are
+#                 signing-key filenames that happen to contain the codename).
 #              4. Runs apt-get update and reports any repository that does
 #                 not serve noble yet, so you can deal with those by hand.
 #
 # Usage    : ansible-playbook reenable-third-party-repos.yml
 #            ansible-playbook reenable-third-party-repos.yml -e rewrite_codename=false
+#            ansible-playbook reenable-third-party-repos.yml -e repo_batch=25%
 # =============================================================================
 
 - name: Re-enable third-party APT repositories after upgrade to Ubuntu 24.04
   hosts: ubuntu_servers
   become: true
+  serial: "{{ repo_batch | default('100%') }}"
+  max_fail_percentage: "{{ max_fail_pct | default(100) }}"
   gather_facts: true
 
   vars:
     old_codename: jammy
     new_codename: noble
     rewrite_codename: true     # set false to re-enable without touching suites
+    sources_dir: /etc/apt/sources.list.d
+
+    # Lines in apt-get update output that mean a repository is genuinely
+    # broken, rather than a cosmetic warning.
+    apt_error_patterns:
+      - '^Err:'
+      - '^E: '
+      - '^W: .*(NO_PUBKEY|not signed|no longer signed|Key is stored in legacy)'
 
   tasks:
 
@@ -46,16 +58,20 @@
     # -------------------------------------------------------------------
     - name: Find .list files disabled by the release upgrader
       ansible.builtin.find:
-        paths: /etc/apt/sources.list.d
+        paths: "{{ sources_dir }}"
         patterns: '*.list'
-        contains: '.*# disabled on upgrade to.*'
+        file_type: file
+        contains: '(?i).*disabled on upgrade.*'
       register: disabled_list_files
 
     - name: Re-enable commented-out entries in .list files
       ansible.builtin.replace:
         path: "{{ item.path }}"
-        regexp: '^#\s*(deb(?:-src)?\s+[^#\n]*?)\s*#\s*disabled on upgrade to\s+\S+\s*$'
+        # [ \t]* rather than \s* at the end: \s* is greedy across newlines and
+        # would swallow the file's final newline.
+        regexp: '^#[ \t]*(deb(?:-src)?[ \t]+[^#\n]*?)[ \t]*#[ \t]*disabled on upgrade to[ \t]+\S+[ \t]*$'
         replace: '\1'
+        backup: true
       loop: "{{ disabled_list_files.files }}"
       loop_control:
         label: "{{ item.path }}"
@@ -66,38 +82,52 @@
     # -------------------------------------------------------------------
     - name: Find .sources files disabled by the release upgrader
       ansible.builtin.find:
-        paths: /etc/apt/sources.list.d
+        paths: "{{ sources_dir }}"
         patterns: '*.sources'
+        file_type: file
         contains: '(?i).*disabled on upgrade.*'
       register: disabled_sources_files
 
     - name: Re-enable deb822 sources
       ansible.builtin.replace:
         path: "{{ item.path }}"
-        regexp: '^Enabled:\s*no\s*$'
+        regexp: '^Enabled:[ \t]*no[ \t]*$'
         replace: 'Enabled: yes'
+        backup: true
       loop: "{{ disabled_sources_files.files }}"
       loop_control:
         label: "{{ item.path }}"
 
+    - name: Collect every file we re-enabled
+      ansible.builtin.set_fact:
+        reenabled_files: "{{ disabled_list_files.files + disabled_sources_files.files }}"
+
+    # Runs over both formats: a .list file can carry the marker on its own
+    # line as well as inline, and the inline form is already gone by now.
     - name: Drop the upgrader's "disabled on upgrade" marker comments
       ansible.builtin.lineinfile:
         path: "{{ item.path }}"
         regexp: '^#.*[Dd]isabled on upgrade.*$'
         state: absent
-      loop: "{{ disabled_sources_files.files }}"
+      loop: "{{ reenabled_files }}"
       loop_control:
         label: "{{ item.path }}"
 
     # -------------------------------------------------------------------
     # Point the re-enabled repos at noble
     # -------------------------------------------------------------------
+    # The negative lookahead keeps the rewrite off signing-key filenames:
+    # "signed-by=/usr/share/keyrings/jammy-archive.gpg" must NOT become
+    # "noble-archive.gpg", or the repo ends up pointing at a keyring that
+    # does not exist. Suites (jammy, jammy-updates) and codenames embedded
+    # in URLs are still rewritten.
     - name: Rewrite suite {{ old_codename }} -> {{ new_codename }} in re-enabled files
       ansible.builtin.replace:
         path: "{{ item.path }}"
-        regexp: '\b{{ old_codename }}\b'
+        regexp: '\b{{ old_codename }}\b(?![\w.+-]*\.(?:gpg|asc|key|pgp))'
         replace: '{{ new_codename }}'
-      loop: "{{ disabled_list_files.files + disabled_sources_files.files }}"
+        backup: true
+      loop: "{{ reenabled_files }}"
       loop_control:
         label: "{{ item.path }}"
       when: rewrite_codename | bool
@@ -106,15 +136,15 @@
       ansible.builtin.debug:
         msg: >-
           Re-enabled
-          {{ (disabled_list_files.files + disabled_sources_files.files)
-             | map(attribute='path') | list
+          {{ reenabled_files | map(attribute='path') | list
              | default(['nothing — no disabled sources found'], true) }}
 
     # -------------------------------------------------------------------
     # Verify every repository actually serves noble
     # -------------------------------------------------------------------
     - name: Refresh apt cache against the re-enabled repositories
-      ansible.builtin.command: apt-get update
+      ansible.builtin.command:
+        cmd: apt-get update
       environment:
         DEBIAN_FRONTEND: noninteractive
       register: apt_update
@@ -124,16 +154,24 @@
     - name: Collect repositories that failed to update
       ansible.builtin.set_fact:
         failed_repos: >-
-          {{ (apt_update.stdout_lines + apt_update.stderr_lines)
-             | select('search', '^(Err:|E: The repository)') | list }}
+          {{ (apt_update.stdout_lines | default([]) + apt_update.stderr_lines | default([]))
+             | select('search', apt_error_patterns | join('|')) | list }}
+
+    # Must be a double-quoted YAML scalar: inside a literal block ("|") the
+    # \n stays a backslash-n and the report comes out on one run-together line.
+    - name: Render the failed repositories as one line each
+      ansible.builtin.set_fact:
+        failed_repos_text: "{{ failed_repos | join('\n') }}"
 
     - name: Warn about repositories that do not serve {{ new_codename }} yet
       ansible.builtin.fail:
         msg: |
           apt-get update reported problems on {{ inventory_hostname }}.
           These repositories likely do not publish {{ new_codename }} packages
-          yet — fix or remove them manually in /etc/apt/sources.list.d/:
-          {{ failed_repos | join('\n') }}
+          yet (or their signing key needs re-importing) — fix or remove them
+          manually in {{ sources_dir }}/. A .bak of every file this playbook
+          touched is next to the original.
+          {{ failed_repos_text }}
       when: apt_update.rc != 0 or failed_repos | length > 0
 
     - name: Report success

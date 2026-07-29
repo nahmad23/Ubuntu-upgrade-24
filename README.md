@@ -19,24 +19,65 @@ stage**.
 Per host, in order:
 
 1. **Pre-flight checks** — skips hosts already on 24.04, aborts on anything
-   that isn't Ubuntu 22.04, requires ≥ 10 GB free on `/`, and verifies the
-   Ubuntu archive is reachable.
-2. **Patch 22.04 first** — full `dist-upgrade` + `autoremove` (the release
+   that isn't Ubuntu 22.04, requires ≥ 10 GB free on `/` **and ≥ 500 MB on
+   `/boot`** (a full `/boot` is the most common way a release upgrade dies
+   half-finished), aborts on held packages, and verifies the noble archive is
+   reachable **via the mirror the host is actually configured against**.
+2. **Quiesce the host** — masks `apt-daily*.timer` and
+   `unattended-upgrades` so they cannot grab the dpkg lock mid-upgrade, waits
+   for any in-flight apt/dpkg run to release its locks, then repairs any
+   half-configured dpkg state (`dpkg --configure -a`, `apt-get --fix-broken`).
+3. **Patch 22.04 first** — full `dist-upgrade` + `autoremove` (the release
    upgrader refuses to run on an out-of-date system), then reboots only if a
    new kernel requires it.
-3. **Prepare the upgrader** — installs `update-manager-core`, sets
+4. **Prepare the upgrader** — installs `update-manager-core`, sets
    `Prompt=lts` in `/etc/update-manager/release-upgrades`, clears stale
-   upgrader state from any previous failed attempt.
-4. **Release upgrade** — runs
-   `do-release-upgrade -f DistUpgradeViewNonInteractive` with
-   `DEBIAN_FRONTEND=noninteractive` and `NEEDRESTART_MODE=a`, so every
-   question (config-file conflicts, service restarts, "remove obsolete
-   packages?") is answered automatically. Existing config files are kept
-   (`confold` behaviour).
-5. **Reboot & verify** — reboots into 24.04, re-gathers facts, and **fails
-   the host** if it still reports 22.04.
-6. **Cleanup** — purges leftover packages and does a final reboot only if
-   required.
+   upgrader state from any previous failed attempt, and confirms with
+   `do-release-upgrade -c` that 24.04 is actually offered — otherwise the
+   upgrade is a silent no-op that only surfaces as a confusing failure after
+   the reboot.
+5. **Release upgrade** — runs
+   `do-release-upgrade -f DistUpgradeViewNonInteractive -m server`. See
+   [Answering prompts safely](#answering-prompts-safely) below.
+6. **Reboot & verify** — reboots into 24.04, re-gathers facts, **fails the
+   host** if it still reports 22.04, and runs `dpkg --audit` to catch packages
+   left half-installed.
+7. **Cleanup** — purges leftover packages, does a final reboot only if
+   required, and **removes the temporary non-interactive overrides** it
+   installed in step 2.
+
+## Answering prompts safely
+
+The upgrade is fully unattended, and every prompt is answered with the
+*non-destructive* answer — nothing on the host is silently overwritten:
+
+| Prompt | Handled by | Answer chosen |
+| --- | --- | --- |
+| dpkg conffile conflict (“keep or replace `/etc/foo.conf`?”) | `Dpkg::Options --force-confdef --force-confold` in a temporary `/etc/apt/apt.conf.d/99-ansible-release-upgrade` | **Keep the file on disk.** The maintainer's version is still written as `*.dpkg-dist` for later review |
+| ucf-managed config files | `UCF_FORCE_CONFOLD=1` | Keep the existing file |
+| “Which services should be restarted?” (whiptail checklist) | debconf preseed `libraries/restart-without-asking=true` | Restart them, rather than leave services running against deleted libraries |
+| needrestart's interactive service list | `/etc/needrestart/conf.d/99-ansible-release-upgrade.conf` with `$nrconf{restart} = 'a'` | Restart automatically |
+| “A newer kernel is available” pager | `$nrconf{kernelhints} = -1` | Suppressed; the playbook reboots explicitly anyway |
+| apt-listchanges pager | `APT_LISTCHANGES_FRONTEND=none` | Skipped |
+| Anything else | `DEBIAN_FRONTEND=noninteractive`, `DEBIAN_PRIORITY=critical`, `DistUpgradeViewNonInteractive` | Package default |
+
+Two things worth knowing:
+
+- **The overrides are temporary.** The apt and needrestart drop-ins are
+  removed, and the apt timers unmasked, in an `always:` block — so this runs
+  even when the upgrade fails. A host is never left permanently auto-answering
+  config questions or with security updates disabled.
+- **Nothing is auto-answered destructively.** `force-confold` never discards a
+  config file you edited. Deliberately *not* preseeded is `grub-pc`'s
+  `install_devices` question: answering it blindly can leave a host without a
+  bootloader. If a host in your fleet asks it, handle that host by hand.
+
+Add your own site-specific answers without editing the playbook:
+
+```bash
+ansible-playbook upgrade-ubuntu-22-to-24.yml \
+  -e '{"extra_debconf_preseed": ["postfix postfix/main_mailer_type select No configuration"]}'
+```
 
 ## Rolling batches (built-in safety for 100 servers)
 
@@ -72,8 +113,10 @@ ansible-playbook upgrade-ubuntu-22-to-24.yml --limit server01.example.com,server
 Grafana, HashiCorp, …) during the upgrade. Once a host is on 24.04, run:
 
 ```bash
-# Same batching/--limit options apply
 ansible-playbook reenable-third-party-repos.yml
+
+# --limit works as usual; batch with -e repo_batch=25%
+ansible-playbook reenable-third-party-repos.yml -e repo_batch=25%
 ```
 
 It finds everything the upgrader disabled in `/etc/apt/sources.list.d/`
@@ -85,13 +128,27 @@ a fixed suite (e.g. Google Chrome's `stable`) are re-enabled but not
 rewritten. Use `-e rewrite_codename=false` if you want to re-enable
 without touching suites at all.
 
+Every file it edits is backed up alongside the original, so a bad rewrite is
+easy to undo. The codename rewrite deliberately skips signing-key filenames —
+`signed-by=/usr/share/keyrings/jammy-archive.gpg` keeps its name, because
+renaming it to `noble-archive.gpg` would point the repo at a keyring that
+doesn't exist. Suites (`jammy`, `jammy-updates`) and codenames in URLs are
+still rewritten.
+
 ## Important notes / caveats
 - **Runtime**: expect 30–90 minutes per server depending on package count,
   disk, and network. The playbook allows up to 2 h per host
   (`release_upgrade_timeout`) before giving up.
 - **SSH resilience**: the release upgrade runs via Ansible `async`, and
   `ansible.cfg` sets aggressive SSH keepalives, so a brief `sshd` restart
-  during the upgrade won't kill the run.
+  during the upgrade won't kill the run. An `async` job that runs out of time
+  is treated as a failure — the playbook will not reboot a half-upgraded host.
+- **On failure**, the playbook prints the tail of `/var/log/dist-upgrade/main.log`
+  from the failed host before marking it failed, so the batch report usually
+  tells you what went wrong without logging in.
+- **`ansible.cfg` sets `host_key_checking = False`**, which accepts any host
+  key presented. That's convenient for a fleet run but means the connection
+  isn't authenticated — if you have a populated `known_hosts`, drop that line.
 - **22.04 → 24.04 only.** The playbook hard-asserts the source version. For
   20.04 hosts you must go 20.04 → 22.04 first (LTS upgrades can't skip a
   release).

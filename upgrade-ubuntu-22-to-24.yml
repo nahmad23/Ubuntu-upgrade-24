@@ -10,6 +10,18 @@
 #            time). Override at runtime:
 #              ansible-playbook ... -e upgrade_batch=5
 #              ansible-playbook ... -e upgrade_batch=25%
+#
+# Prompts  : Every interactive prompt the upgrade can raise is answered
+#            automatically with the *safe* (keep-what-you-have) answer:
+#              * dpkg conffile conflicts -> --force-confdef --force-confold
+#                (keep the config already on disk, never overwrite it)
+#              * ucf-managed configs     -> UCF_FORCE_CONFOLD=1
+#              * "restart services?"     -> debconf preseed + needrestart 'a'
+#              * "new kernel available"  -> needrestart kernelhints disabled
+#              * apt-listchanges pager   -> APT_LISTCHANGES_FRONTEND=none
+#            These overrides are dropped into place before the upgrade and
+#            REMOVED again afterwards (see the `always:` block), so hosts are
+#            not left permanently answering config questions on their own.
 # =============================================================================
 
 - name: Upgrade Ubuntu 22.04 LTS to 24.04 LTS (unattended)
@@ -21,13 +33,38 @@
 
   vars:
     required_free_space_mb: 10240        # 10 GB free on / before we start
+    required_boot_free_space_mb: 500     # /boot must fit the new kernel+initrd
     dist_upgrade_timeout: 3600           # 1 hour for the pre-upgrade dist-upgrade
     release_upgrade_timeout: 7200        # 2 hours for do-release-upgrade
     reboot_timeout: 1200                 # 20 min for the post-upgrade reboot
+    lock_wait_timeout: 900               # 15 min waiting for the dpkg lock
+    fail_on_held_packages: true          # held packages make the upgrader bail
+    archive_check_url: ''                # empty => derive from the host's mirror
+    archive_check_timeout: 15
+
+    # Written to /etc/apt/apt.conf.d and /etc/needrestart/conf.d for the
+    # duration of the upgrade only, then removed again.
+    apt_noninteractive_conf: /etc/apt/apt.conf.d/99-ansible-release-upgrade
+    needrestart_conf: /etc/needrestart/conf.d/99-ansible-release-upgrade.conf
+
     apt_noninteractive_env:
       DEBIAN_FRONTEND: noninteractive
+      DEBIAN_PRIORITY: critical          # only ask truly critical questions
       NEEDRESTART_MODE: a                # auto-restart services, never prompt
       APT_LISTCHANGES_FRONTEND: none
+      UCF_FORCE_CONFOLD: '1'             # ucf keeps the on-disk config file
+      RELEASE_UPGRADER_NO_SCREEN: '1'    # never re-exec inside screen(1)
+
+    # debconf questions that otherwise pop a whiptail dialog mid-upgrade and
+    # block forever. "restart-without-asking = true" is the safe answer for a
+    # server fleet: services are restarted rather than left running against
+    # deleted libraries.
+    debconf_preseed:
+      - 'libc6 libraries/restart-without-asking boolean true'
+      - 'libpam0g libraries/restart-without-asking boolean true'
+      - 'libssl3 libraries/restart-without-asking boolean true'
+      - 'libssl1.1 libraries/restart-without-asking boolean true'
+    extra_debconf_preseed: []            # add your own site-specific answers
 
   pre_tasks:
 
@@ -49,145 +86,416 @@
           Host is {{ ansible_distribution }} {{ ansible_distribution_version }},
           expected Ubuntu 22.04. Refusing to upgrade.
 
-    - name: Check free disk space on /
+    - name: Record the filesystem backing /
+      ansible.builtin.set_fact:
+        root_fs: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | first | default(None) }}"
+
+    - name: Abort if / was not found in the gathered mounts
       ansible.builtin.assert:
         that:
-          - (item.size_available / 1024 / 1024) | int > required_free_space_mb
+          - root_fs is not none
+          - root_fs.size_available is defined
         fail_msg: >-
-          Only {{ (item.size_available / 1024 / 1024) | int }} MB free on /,
-          need at least {{ required_free_space_mb }} MB.
-      loop: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | list }}"
-      loop_control:
-        label: "{{ item.mount }}"
+          Could not determine free space on / from ansible_mounts. Refusing to
+          start an upgrade without a disk-space check.
 
-    - name: Verify the Ubuntu archive is reachable
+    # /boot is frequently a small separate partition; a full /boot is one of
+    # the most common ways a release upgrade dies half-finished.
+    - name: Record the filesystem backing /boot
+      ansible.builtin.set_fact:
+        boot_fs: "{{ ansible_mounts | selectattr('mount', 'equalto', '/boot') | first | default(root_fs) }}"
+
+    - name: Check free disk space on / and /boot
+      ansible.builtin.assert:
+        that:
+          - (root_fs.size_available / 1024 / 1024) | int >= (required_free_space_mb | int)
+          - (boot_fs.size_available / 1024 / 1024) | int >= (required_boot_free_space_mb | int)
+        fail_msg: >-
+          Not enough free space:
+          / has {{ (root_fs.size_available / 1024 / 1024) | int }} MB
+          (need {{ required_free_space_mb }} MB),
+          {{ boot_fs.mount }} has {{ (boot_fs.size_available / 1024 / 1024) | int }} MB
+          (need {{ required_boot_free_space_mb }} MB on /boot).
+
+    # Use the mirror the host is actually configured against — hard-coding
+    # archive.ubuntu.com falsely fails hosts on regional or internal mirrors.
+    - name: Determine the Ubuntu archive mirror configured on this host
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          {
+            awk '/^deb(-src)?[[:space:]]/ {print $2}' /etc/apt/sources.list 2>/dev/null
+            awk '/^URIs:/ {print $2}' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null
+          } | grep -v '^$' | head -n1
+        executable: /bin/bash
+      register: detected_mirror
+      changed_when: false
+      failed_when: false
+
+    - name: Decide which URL proves the 24.04 archive is reachable
+      ansible.builtin.set_fact:
+        noble_release_url: >-
+          {{ archive_check_url if (archive_check_url | length > 0)
+             else ((detected_mirror.stdout | trim | regex_replace('/+$', ''))
+                   ~ '/dists/noble/Release') }}
+
+    - name: Verify the 24.04 (noble) archive is reachable from this host
       ansible.builtin.uri:
-        url: http://archive.ubuntu.com/ubuntu/dists/noble/Release
+        url: "{{ noble_release_url }}"
         method: HEAD
-        timeout: 15
+        timeout: "{{ archive_check_timeout }}"
+      register: archive_check
+      retries: 3
+      delay: 5
+      until: archive_check is succeeded
+      when: detected_mirror.stdout | trim | length > 0 or archive_check_url | length > 0
+
+    - name: List packages held back from upgrading
+      ansible.builtin.command:
+        cmd: apt-mark showhold
+      register: held_packages
+      changed_when: false
+
+    - name: Abort if packages are held (the release upgrader refuses to run)
+      ansible.builtin.assert:
+        that:
+          - held_packages.stdout | trim | length == 0
+        fail_msg: >-
+          These packages are held on {{ inventory_hostname }} and will make
+          do-release-upgrade abort:
+          {{ held_packages.stdout_lines | join(', ') }}.
+          Unhold them (apt-mark unhold ...) or re-run with
+          -e fail_on_held_packages=false to proceed anyway.
+      when: fail_on_held_packages | bool
 
   tasks:
 
-    # -------------------------------------------------------------------
-    # STEP 1 — Bring 22.04 fully up to date first (required by the
-    #          release upgrader) and reboot if a new kernel landed.
-    # -------------------------------------------------------------------
-    - name: Wait for any running apt/dpkg operations to finish
-      ansible.builtin.shell: >-
-        while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock
-        >/dev/null 2>&1; do sleep 5; done
-      changed_when: false
-      async: 600
-      poll: 10
+    - block:
 
-    - name: Update apt cache and apply all pending 22.04 updates
-      ansible.builtin.apt:
-        update_cache: true
-        upgrade: dist
-        autoremove: true
-        autoclean: true
-        dpkg_options: 'force-confdef,force-confold'
-      environment: "{{ apt_noninteractive_env }}"
-      async: "{{ dist_upgrade_timeout }}"
-      poll: 30
+        # ---------------------------------------------------------------
+        # STEP 0 — Make the machine safe to run a long unattended upgrade
+        #          on: no competing apt runs, no interactive prompts.
+        # ---------------------------------------------------------------
+        - name: Mask the periodic apt timers so they cannot grab the dpkg lock
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: stopped
+            masked: true
+          loop:
+            - apt-daily.timer
+            - apt-daily-upgrade.timer
+            - unattended-upgrades.service
+          failed_when: false
 
-    - name: Check whether a reboot is required before the release upgrade
-      ansible.builtin.stat:
-        path: /var/run/reboot-required
-      register: reboot_required_pre
+        # dpkg/apt take fcntl(F_SETLK) locks, which flock(1) cannot see, and
+        # fuser(1) lives in psmisc, which is absent from minimal cloud images.
+        # Probe the locks the same way apt does instead.
+        - name: Wait for any running apt/dpkg operation to release its locks
+          ansible.builtin.shell:
+            cmd: |
+              python3 - "{{ lock_wait_timeout }}" <<'PY'
+              import fcntl, os, sys, time
+              deadline = time.time() + int(sys.argv[1])
+              locks = ("/var/lib/dpkg/lock-frontend",
+                       "/var/lib/dpkg/lock",
+                       "/var/lib/apt/lists/lock")
+              while True:
+                  busy = []
+                  for path in locks:
+                      if not os.path.exists(path):
+                          continue
+                      try:
+                          fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o640)
+                      except OSError:
+                          continue
+                      try:
+                          fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                          fcntl.lockf(fd, fcntl.LOCK_UN)
+                      except OSError:
+                          busy.append(path)
+                      finally:
+                          os.close(fd)
+                  if not busy:
+                      sys.exit(0)
+                  if time.time() >= deadline:
+                      sys.stderr.write("still locked: %s\n" % ", ".join(busy))
+                      sys.exit(1)
+                  time.sleep(5)
+              PY
+            executable: /bin/bash
+          changed_when: false
 
-    - name: Reboot to load the latest 22.04 kernel
-      ansible.builtin.reboot:
-        reboot_timeout: "{{ reboot_timeout }}"
-        msg: "Rebooting before Ubuntu release upgrade (Ansible)"
-      when: reboot_required_pre.stat.exists
+        - name: Install the temporary apt non-interactive configuration
+          ansible.builtin.copy:
+            dest: "{{ apt_noninteractive_conf }}"
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              // Installed by Ansible for the duration of the 22.04 -> 24.04
+              // release upgrade, and removed again once it completes.
+              // force-confdef + force-confold = answer every conffile prompt
+              // with "keep the version currently on disk", which is the
+              // non-destructive choice; the maintainer's version is still
+              // written alongside as *.dpkg-dist for later review.
+              Dpkg::Options {
+                  "--force-confdef";
+                  "--force-confold";
+              };
+              APT::Get::Assume-Yes "true";
+              Dpkg::Use-Pty "0";
 
-    # -------------------------------------------------------------------
-    # STEP 2 — Prepare the release upgrader for unattended operation
-    # -------------------------------------------------------------------
-    - name: Ensure update-manager-core is installed
-      ansible.builtin.apt:
-        name: update-manager-core
-        state: present
-      environment: "{{ apt_noninteractive_env }}"
+        - name: Install the temporary needrestart configuration
+          ansible.builtin.copy:
+            dest: "{{ needrestart_conf }}"
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              # Installed by Ansible for the duration of the release upgrade.
+              # 'a' = restart outdated services automatically instead of
+              # showing the interactive checklist that blocks dpkg.
+              $nrconf{restart} = 'a';
+              # Suppress the "a newer kernel is available" pager/dialog; the
+              # playbook reboots explicitly at the end anyway.
+              $nrconf{kernelhints} = -1;
+              $nrconf{ucodehints} = 0;
+              1;
 
-    - name: Allow upgrades to the next LTS release (Prompt=lts)
-      ansible.builtin.lineinfile:
-        path: /etc/update-manager/release-upgrades
-        regexp: '^Prompt='
-        line: 'Prompt=lts'
+        - name: Pre-answer the debconf questions that would otherwise block
+          ansible.builtin.shell:
+            cmd: debconf-set-selections
+            stdin: "{{ (debconf_preseed + extra_debconf_preseed) | join('\n') }}\n"
+          changed_when: true
 
-    - name: Remove any stale release-upgrader lock/state from failed runs
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /var/lib/update-manager/meta-release-lts
-        - /var/lib/ubuntu-release-upgrader/release-upgrade-available
+        - name: Repair any dpkg state left half-configured by an earlier run
+          ansible.builtin.command:
+            cmd: dpkg --configure -a --force-confdef --force-confold
+          environment: "{{ apt_noninteractive_env }}"
+          changed_when: false
 
-    # -------------------------------------------------------------------
-    # STEP 3 — Run the release upgrade completely non-interactively.
-    #          DistUpgradeViewNonInteractive answers every prompt with
-    #          the default and keeps existing config files (confold).
-    # -------------------------------------------------------------------
-    - name: Run do-release-upgrade (non-interactive, this takes 30-90 min)
-      ansible.builtin.command:
-        cmd: do-release-upgrade -f DistUpgradeViewNonInteractive
-      environment: "{{ apt_noninteractive_env }}"
-      async: "{{ release_upgrade_timeout }}"
-      poll: 60
-      register: release_upgrade
-      failed_when:
-        - release_upgrade.rc is defined
-        - release_upgrade.rc != 0
+        - name: Resolve any broken dependencies before starting
+          ansible.builtin.command:
+            cmd: apt-get -y --fix-broken install
+          environment: "{{ apt_noninteractive_env }}"
+          changed_when: false
 
-    # -------------------------------------------------------------------
-    # STEP 4 — Reboot into 24.04 and verify
-    # -------------------------------------------------------------------
-    - name: Reboot into Ubuntu 24.04
-      ansible.builtin.reboot:
-        reboot_timeout: "{{ reboot_timeout }}"
-        msg: "Rebooting to complete Ubuntu 24.04 upgrade (Ansible)"
+        # ---------------------------------------------------------------
+        # STEP 1 — Bring 22.04 fully up to date first (required by the
+        #          release upgrader) and reboot if a new kernel landed.
+        # ---------------------------------------------------------------
+        - name: Update apt cache and apply all pending 22.04 updates
+          ansible.builtin.apt:
+            update_cache: true
+            upgrade: dist
+            autoremove: true
+            autoclean: true
+            dpkg_options: 'force-confdef,force-confold'
+          environment: "{{ apt_noninteractive_env }}"
+          async: "{{ dist_upgrade_timeout }}"
+          poll: 30
 
-    - name: Re-gather facts after the upgrade
-      ansible.builtin.setup:
+        - name: Check whether a reboot is required before the release upgrade
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: reboot_required_pre
 
-    - name: Verify the host is now running Ubuntu 24.04
-      ansible.builtin.assert:
-        that:
-          - ansible_distribution_version is version('24.04', '>=')
-        fail_msg: >-
-          Upgrade appears to have failed — host still reports
-          {{ ansible_distribution }} {{ ansible_distribution_version }}.
-          Check /var/log/dist-upgrade/ on the host.
-        success_msg: >-
-          Host successfully upgraded to
-          {{ ansible_distribution }} {{ ansible_distribution_version }}.
+        - name: Reboot to load the latest 22.04 kernel
+          ansible.builtin.reboot:
+            reboot_timeout: "{{ reboot_timeout }}"
+            post_reboot_delay: 15
+            msg: "Rebooting before Ubuntu release upgrade (Ansible)"
+          when: reboot_required_pre.stat.exists
 
-    # -------------------------------------------------------------------
-    # STEP 5 — Post-upgrade cleanup
-    # -------------------------------------------------------------------
-    - name: Remove packages left over from the old release
-      ansible.builtin.apt:
-        update_cache: true
-        autoremove: true
-        autoclean: true
-        purge: true
-      environment: "{{ apt_noninteractive_env }}"
+        # ---------------------------------------------------------------
+        # STEP 2 — Prepare the release upgrader for unattended operation
+        # ---------------------------------------------------------------
+        - name: Ensure update-manager-core is installed
+          ansible.builtin.apt:
+            name: update-manager-core
+            state: present
+          environment: "{{ apt_noninteractive_env }}"
 
-    - name: Check whether a final reboot is required
-      ansible.builtin.stat:
-        path: /var/run/reboot-required
-      register: reboot_required_post
+        - name: Allow upgrades to the next LTS release (Prompt=lts)
+          ansible.builtin.lineinfile:
+            path: /etc/update-manager/release-upgrades
+            regexp: '^\s*Prompt\s*='
+            line: 'Prompt=lts'
+            create: true
+            owner: root
+            group: root
+            mode: '0644'
 
-    - name: Final reboot if cleanup requires it
-      ansible.builtin.reboot:
-        reboot_timeout: "{{ reboot_timeout }}"
-      when: reboot_required_post.stat.exists
+        - name: Remove any stale release-upgrader lock/state from failed runs
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /var/lib/update-manager/meta-release-lts
+            - /var/lib/ubuntu-release-upgrader/release-upgrade-available
 
-    - name: Report success
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }} upgraded to
-          {{ ansible_distribution }} {{ ansible_distribution_version }}
-          (kernel {{ ansible_kernel }})
+        # Catch the silent no-op case: if the meta-release server does not
+        # offer 24.04 to this host, do-release-upgrade exits 0 having done
+        # nothing, and without this check we would reboot and then fail with a
+        # confusing "still on 22.04" message.
+        - name: Confirm the upgrader actually offers a new release
+          ansible.builtin.command:
+            cmd: do-release-upgrade -c -m server
+          environment: "{{ apt_noninteractive_env }}"
+          register: release_check
+          changed_when: false
+          failed_when: false
+          async: 300
+          poll: 10
+
+        - name: Abort if no new release is offered to this host
+          ansible.builtin.assert:
+            that:
+              - >-
+                'New release' in ((release_check.stdout | default('')) ~
+                                  (release_check.stderr | default('')))
+            fail_msg: >-
+              do-release-upgrade -c reports no new release for
+              {{ inventory_hostname }} (rc={{ release_check.rc | default('?') }}):
+              {{ (release_check.stdout | default('') ~ ' ' ~ release_check.stderr | default('')) | trim }}
+              Check Prompt=lts in /etc/update-manager/release-upgrades and that
+              changelogs.ubuntu.com is reachable.
+
+        # ---------------------------------------------------------------
+        # STEP 3 — Run the release upgrade completely non-interactively.
+        #          DistUpgradeViewNonInteractive answers every prompt with
+        #          the default and keeps existing config files (confold).
+        # ---------------------------------------------------------------
+        - name: Run do-release-upgrade (non-interactive, this takes 30-90 min)
+          ansible.builtin.command:
+            cmd: do-release-upgrade -f DistUpgradeViewNonInteractive -m server
+          environment: "{{ apt_noninteractive_env }}"
+          async: "{{ release_upgrade_timeout }}"
+          poll: 60
+          register: release_upgrade
+          # NOTE: failed_when replaces the module's own failure check, so it
+          # must also treat "no rc at all" (async timeout / unreachable) as a
+          # failure. Otherwise a timed-out upgrade would be reported OK and
+          # the play would reboot a half-upgraded host.
+          failed_when: >-
+            release_upgrade.rc is not defined
+            or release_upgrade.rc != 0
+            or 'No new release found' in (release_upgrade.stdout | default(''))
+
+        # ---------------------------------------------------------------
+        # STEP 4 — Reboot into 24.04 and verify
+        # ---------------------------------------------------------------
+        - name: Reboot into Ubuntu 24.04
+          ansible.builtin.reboot:
+            reboot_timeout: "{{ reboot_timeout }}"
+            post_reboot_delay: 30
+            msg: "Rebooting to complete Ubuntu 24.04 upgrade (Ansible)"
+
+        - name: Re-gather facts after the upgrade
+          ansible.builtin.setup:
+
+        - name: Verify the host is now running Ubuntu 24.04
+          ansible.builtin.assert:
+            that:
+              - ansible_distribution_version is version('24.04', '>=')
+            fail_msg: >-
+              Upgrade appears to have failed — host still reports
+              {{ ansible_distribution }} {{ ansible_distribution_version }}.
+              Check /var/log/dist-upgrade/ on the host.
+            success_msg: >-
+              Host successfully upgraded to
+              {{ ansible_distribution }} {{ ansible_distribution_version }}.
+
+        - name: Check for packages left unconfigured by the upgrade
+          ansible.builtin.command:
+            cmd: dpkg --audit
+          register: dpkg_audit
+          changed_when: false
+          failed_when: false
+
+        - name: Fail if any package is still half-installed or unconfigured
+          ansible.builtin.assert:
+            that:
+              - dpkg_audit.stdout | trim | length == 0
+            fail_msg: >-
+              dpkg reports packages in a broken state after the upgrade on
+              {{ inventory_hostname }}:
+              {{ dpkg_audit.stdout | trim }}
+
+        # ---------------------------------------------------------------
+        # STEP 5 — Post-upgrade cleanup
+        # ---------------------------------------------------------------
+        - name: Remove packages left over from the old release
+          ansible.builtin.apt:
+            update_cache: true
+            autoremove: true
+            autoclean: true
+            purge: true
+            dpkg_options: 'force-confdef,force-confold'
+          environment: "{{ apt_noninteractive_env }}"
+
+        - name: Check whether a final reboot is required
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: reboot_required_post
+
+        - name: Final reboot if cleanup requires it
+          ansible.builtin.reboot:
+            reboot_timeout: "{{ reboot_timeout }}"
+            post_reboot_delay: 15
+          when: reboot_required_post.stat.exists
+
+        - name: Report success
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }} upgraded to
+              {{ ansible_distribution }} {{ ansible_distribution_version }}
+              (kernel {{ ansible_kernel }})
+
+      rescue:
+        - name: Collect the tail of the release upgrader log
+          ansible.builtin.command:
+            cmd: tail -n 80 /var/log/dist-upgrade/main.log
+          register: upgrade_log
+          changed_when: false
+          failed_when: false
+
+        - name: Show the release upgrader log tail
+          ansible.builtin.debug:
+            var: upgrade_log.stdout_lines
+
+        - name: Fail the host after reporting the upgrade error
+          ansible.builtin.fail:
+            msg: >-
+              Upgrade failed on {{ inventory_hostname }}
+              ({{ ansible_failed_task.name | default('unknown task') }}).
+              Full logs are in /var/log/dist-upgrade/ on the host.
+
+      always:
+        # Leaving force-confold in place permanently would silently keep stale
+        # config files forever, and leaving the apt timers masked would stop
+        # security updates. Both are undone whether we succeeded or failed.
+        - name: Remove the temporary non-interactive overrides
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ apt_noninteractive_conf }}"
+            - "{{ needrestart_conf }}"
+
+        - name: Unmask and restart the periodic apt timers
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            masked: false
+            state: started
+            daemon_reload: true
+          loop:
+            - apt-daily.timer
+            - apt-daily-upgrade.timer
+          failed_when: false
+
+        - name: Unmask unattended-upgrades
+          ansible.builtin.systemd:
+            name: unattended-upgrades.service
+            masked: false
+          failed_when: false
