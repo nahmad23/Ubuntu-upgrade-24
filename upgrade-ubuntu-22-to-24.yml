@@ -187,13 +187,26 @@
           if not urls:
               sys.exit("no UpgradeTool entry for '%s' in %s" % (target, meta))
 
+          # Fetch a few real bytes rather than just HEAD: an intercepting
+          # proxy happily answers HEAD with 200 and then serves an HTML
+          # error page for the GET. The upgrader would download that,
+          # fail to verify its signature, and abort in seconds with no
+          # output — the exact symptom this check exists to explain.
           for url in urls:
               try:
-                  urllib.request.urlopen(
-                      urllib.request.Request(url, method="HEAD"), timeout=30)
+                  req = urllib.request.Request(url, headers={"Range": "bytes=0-511"})
+                  head = urllib.request.urlopen(req, timeout=30).read(512)
               except Exception as exc:
                   sys.exit("cannot fetch the upgrade tool %s: %s" % (url, exc))
-              print("reachable: %s" % url)
+              if url.endswith(".gz") and not head.startswith(b"\x1f\x8b"):
+                  sys.exit("%s did not return gzip data (got %r...) — something "
+                           "is intercepting this request" % (url, head[:40]))
+              # The .gpg is binary OpenPGP whose leading byte varies, so only
+              # rule out the failure that actually happens: an HTML error page.
+              if b"<html" in head[:512].lower() or b"<!doctype" in head[:512].lower():
+                  sys.exit("%s returned an HTML page rather than the file — "
+                           "something is intercepting this request" % url)
+              print("reachable and intact: %s" % url)
           PY
         executable: /bin/bash
       register: upgrade_tool_check
@@ -607,16 +620,38 @@
             var: upgrade_log.stdout_lines
           when: (upgrade_log.rc | default(1)) == 0
 
+        # Both must be double-quoted YAML scalars so \n is a real newline; in
+        # a literal block ("|") it stays a backslash-n and the whole report
+        # collapses onto one unreadable line.
+        - name: Assemble the diagnostic report
+          ansible.builtin.set_fact:
+            upgrade_error_text: "{{ (upgrade_errors.stdout_lines | default([]))
+                                    | join('\n') }}"
+            upgrade_tail_text: "{{ (upgrade_log.stdout_lines | default([]))[-30:]
+                                   | join('\n') }}"
+
+        # The diagnosis goes in the failure message itself, not in a separate
+        # task. do-release-upgrade's own stdout is always empty under the
+        # non-interactive frontend, so without this the fatal output an
+        # operator sees and pastes contains nothing actionable at all.
         - name: Fail the host after reporting the upgrade error
           ansible.builtin.fail:
-            msg: >-
+            msg: |-
               Upgrade failed on {{ inventory_hostname }} at task
               "{{ ansible_failed_task.name | default('unknown') }}".
-              {{ 'See /var/log/dist-upgrade/ on the host for the upgrader log.'
-                 if (upgrade_log.rc | default(1)) == 0
-                 else 'The release upgrader had not started yet, so there is no
-                       /var/log/dist-upgrade log — the task error above is the
-                       whole story.' }}
+
+              do-release-upgrade writes nothing to stdout under
+              DistUpgradeViewNonInteractive; everything below comes from
+              /var/log/dist-upgrade/main.log on the host.
+
+              ===== matching error lines =====
+              {{ upgrade_error_text | default('', true) | trim
+                 | default('(no matching lines — see the tail below)', true) }}
+
+              ===== last 30 lines of main.log =====
+              {{ upgrade_tail_text | default('', true) | trim
+                 | default('(main.log absent — the upgrader never started)', true) }}
+              ================================
 
       always:
         # Leaving force-confold in place permanently would silently keep stale
