@@ -179,6 +179,18 @@ still rewritten.
 - **Runtime**: expect 30–90 minutes per server depending on package count,
   disk, and network. The playbook allows up to 2 h per host
   (`release_upgrade_timeout`) before giving up.
+- **`poll` vs `timeout`** — these are often confused. `*_poll` is how often
+  Ansible asks "are you done yet?"; lowering it does **not** make the upgrade
+  faster, it only detects completion sooner and prints progress lines more
+  often. `*_timeout` is what actually caps the runtime.
+
+  ```bash
+  # check every 5s instead of 15s (more progress output, no faster)
+  ansible-playbook upgrade-ubuntu-22-to-24.yml -e release_upgrade_poll=5
+
+  # allow 4 h per host instead of 2 h, for genuinely slow servers
+  ansible-playbook upgrade-ubuntu-22-to-24.yml -e release_upgrade_timeout=14400
+  ```
 - **SSH resilience**: the release upgrade runs via Ansible `async`, and
   `ansible.cfg` sets aggressive SSH keepalives, so a brief `sshd` restart
   during the upgrade won't kill the run. An `async` job that runs out of time

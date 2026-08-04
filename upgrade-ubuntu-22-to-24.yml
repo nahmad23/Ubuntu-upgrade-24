@@ -47,6 +47,13 @@
     required_boot_free_space_mb: 500     # /boot must fit the new kernel+initrd
     dist_upgrade_timeout: 3600           # 1 hour for the pre-upgrade dist-upgrade
     release_upgrade_timeout: 7200        # 2 hours for do-release-upgrade
+
+    # How often Ansible asks "are you done yet?". This is the check interval,
+    # NOT how long the upgrade takes — lowering it does not speed anything up,
+    # it just detects completion sooner and prints progress lines more often.
+    # The *_timeout values above are what actually cap the runtime.
+    dist_upgrade_poll: 15
+    release_upgrade_poll: 15
     reboot_timeout: 1200                 # 20 min for the post-upgrade reboot
     lock_wait_timeout: 900               # 15 min waiting for the dpkg lock
     fail_on_held_packages: true          # held packages make the upgrader bail
@@ -395,7 +402,7 @@
             dpkg_options: 'force-confdef,force-confold'
           environment: "{{ apt_noninteractive_env }}"
           async: "{{ dist_upgrade_timeout }}"
-          poll: 30
+          poll: "{{ dist_upgrade_poll }}"
 
         - name: Check whether a reboot is required before the release upgrade
           ansible.builtin.stat:
@@ -546,7 +553,7 @@
             cmd: do-release-upgrade -f DistUpgradeViewNonInteractive -m server
           environment: "{{ apt_noninteractive_env }}"
           async: "{{ release_upgrade_timeout }}"
-          poll: 60
+          poll: "{{ release_upgrade_poll }}"
           register: release_upgrade
           # NOTE: failed_when replaces the module's own failure check, so it
           # must also treat "no rc at all" (async timeout / unreachable) as a
