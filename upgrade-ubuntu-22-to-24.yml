@@ -32,6 +32,17 @@
   gather_facts: true
 
   vars:
+    # Pin the interpreter to the unversioned symlink, which exists on both
+    # 22.04 and 24.04. Ansible's default discovery resolves a *versioned*
+    # path (/usr/bin/python3.10 on jammy) and caches it for the whole play —
+    # but the release upgrade replaces python3.10 with python3.12 underneath
+    # us, so every task after do-release-upgrade dies with
+    #   /bin/sh: 1: /usr/bin/python3.10: not found     (rc=127)
+    # including the always: block that removes the temporary overrides and
+    # unmasks the apt timers. Left that way, the host silently stops taking
+    # security updates.
+    ansible_python_interpreter: /usr/bin/python3
+
     required_free_space_mb: 10240        # 10 GB free on / before we start
     required_boot_free_space_mb: 500     # /boot must fit the new kernel+initrd
     dist_upgrade_timeout: 3600           # 1 hour for the pre-upgrade dist-upgrade
@@ -621,15 +632,30 @@
         # that is a completely different problem from the upgrader exiting
         # non-zero — one means "too slow", the other means "it refused".
         # Say which, rather than making the operator guess.
+        # raw runs over the shell and needs no python on the target, so it
+        # still answers when a broken interpreter is the reason we are here.
+        - name: Check which release the host is actually running now
+          ansible.builtin.raw: . /etc/os-release && echo "$VERSION_ID"
+          register: raw_release
+          changed_when: false
+          failed_when: false
+
         - name: Summarise how do-release-upgrade ended
           ansible.builtin.debug:
             msg: >-
-              {{ ('do-release-upgrade did not finish within '
-                  ~ release_upgrade_timeout ~ 's and was abandoned (async '
-                  ~ 'timeout) — re-run with a larger -e release_upgrade_timeout '
-                  ~ 'if the host is simply slow.')
-                 if release_upgrade.rc is not defined
-                 else ('do-release-upgrade exited rc=' ~ release_upgrade.rc) }}
+              Host now reports Ubuntu
+              {{ raw_release.stdout | default('unknown') | trim }}.
+              {{ ('The release upgrade itself COMPLETED — only the post-upgrade'
+              ~ ' bookkeeping failed, so the host still needs a reboot and'
+              ~ ' cleanup. Re-run this playbook: it will pick the host up on'
+              ~ ' 24.04 and finish the job.')
+              if ('24.04' in (raw_release.stdout | default('')))
+              else (('do-release-upgrade did not finish within '
+              ~ release_upgrade_timeout ~ 's and was abandoned (async timeout)'
+              ~ ' — re-run with a larger -e release_upgrade_timeout if the'
+              ~ ' host is simply slow.')
+              if release_upgrade.rc is not defined
+              else ('do-release-upgrade exited rc=' ~ release_upgrade.rc)) }}
           when: release_upgrade is defined
 
         # The upgrader's own stdout usually names the blocker (unresolvable
@@ -731,6 +757,10 @@
         # Leaving force-confold in place permanently would silently keep stale
         # config files forever, and leaving the apt timers masked would stop
         # security updates. Both are undone whether we succeeded or failed.
+        # ignore_errors, because a failure here must not skip the unmask
+        # tasks below it: a task that fails inside always: stops the rest of
+        # the always: block, and leaving the apt timers masked means the host
+        # quietly stops receiving security updates.
         - name: Remove the temporary non-interactive overrides
           ansible.builtin.file:
             path: "{{ item }}"
@@ -738,6 +768,7 @@
           loop:
             - "{{ apt_noninteractive_conf }}"
             - "{{ needrestart_conf }}"
+          ignore_errors: true
 
         - name: Unmask and restart the periodic apt timers
           ansible.builtin.systemd:
