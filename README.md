@@ -152,5 +152,10 @@ still rewritten.
 - **22.04 → 24.04 only.** The playbook hard-asserts the source version. For
   20.04 hosts you must go 20.04 → 22.04 first (LTS upgrades can't skip a
   release).
-- Requires Ansible ≥ 2.12 on the control node and Python 3 + `sudo` on the
+- **No collections required.** Every module used is `ansible.builtin.*`, so
+  `ansible-core` alone is enough and there is nothing to install from Galaxy.
+  `ansible.cfg` uses `callback_result_format = yaml` (ansible-core 2.13+) for
+  readable output rather than the `community.general.yaml` callback, which was
+  removed in community.general 12.0.0.
+- Requires ansible-core ≥ 2.13 on the control node and Python 3 + `sudo` on the
   targets (standard on Ubuntu 22.04).
