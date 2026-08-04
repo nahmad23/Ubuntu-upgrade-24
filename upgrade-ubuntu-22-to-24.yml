@@ -39,6 +39,7 @@
     reboot_timeout: 1200                 # 20 min for the post-upgrade reboot
     lock_wait_timeout: 900               # 15 min waiting for the dpkg lock
     fail_on_held_packages: true          # held packages make the upgrader bail
+    check_upgrade_tool_reachable: true   # verify archive.ubuntu.com is allowed
     archive_check_url: ''                # empty => derive from the host's mirror
     archive_check_timeout: 15
 
@@ -149,6 +150,69 @@
       delay: 5
       until: archive_check is succeeded
       when: detected_mirror.stdout | trim | length > 0 or archive_check_url | length > 0
+
+    # do-release-upgrade does NOT fetch its own upgrade tool from the mirror
+    # configured on the host — it fetches the URL named in meta-release, which
+    # points at archive.ubuntu.com. A fleet behind an internal mirror can
+    # therefore pass every check above and still fail, because that one host
+    # is the only thing the firewall does not allow. Check it explicitly:
+    # the failure it causes is a bare rc=1 in ~10s with no output at all.
+    - name: Check the host can fetch the release upgrader itself
+      ansible.builtin.shell:
+        cmd: |
+          python3 - noble <<'PY'
+          import configparser, os, sys, urllib.request
+
+          target = sys.argv[1]
+          meta = "http://changelogs.ubuntu.com/meta-release-lts"
+          cfg = "/etc/update-manager/meta-release"
+          if os.path.exists(cfg):
+              cp = configparser.ConfigParser()
+              try:
+                  cp.read(cfg)
+                  meta = cp.get("METARELEASE", "uri_lts", fallback=meta)
+              except configparser.Error:
+                  pass
+
+          try:
+              body = urllib.request.urlopen(meta, timeout=30).read()
+          except Exception as exc:
+              sys.exit("cannot fetch the release list %s: %s" % (meta, exc))
+
+          urls = []
+          for block in body.decode("utf-8", "replace").split("\n\n"):
+              if ("Dist: %s" % target) in block.splitlines():
+                  urls += [ln.split(None, 1)[1].strip() for ln in block.splitlines()
+                           if ln.startswith(("UpgradeTool:", "UpgradeToolSignature:"))]
+          if not urls:
+              sys.exit("no UpgradeTool entry for '%s' in %s" % (target, meta))
+
+          for url in urls:
+              try:
+                  urllib.request.urlopen(
+                      urllib.request.Request(url, method="HEAD"), timeout=30)
+              except Exception as exc:
+                  sys.exit("cannot fetch the upgrade tool %s: %s" % (url, exc))
+              print("reachable: %s" % url)
+          PY
+        executable: /bin/bash
+      register: upgrade_tool_check
+      changed_when: false
+      failed_when: false
+      when: check_upgrade_tool_reachable | bool
+
+    - name: Abort if the release upgrader cannot be downloaded
+      ansible.builtin.assert:
+        that:
+          - upgrade_tool_check.rc == 0
+        fail_msg: >-
+          {{ inventory_hostname }} cannot download the release upgrader, so
+          do-release-upgrade would fail immediately with an empty error:
+          {{ (upgrade_tool_check.stderr | default('')) | trim }}
+          Note this URL is archive.ubuntu.com, NOT the mirror in
+          /etc/apt/sources.list — allow it through the firewall/proxy, or
+          point /etc/update-manager/meta-release at an internal copy.
+      when: check_upgrade_tool_reachable | bool
 
     - name: List packages held back from upgrading
       ansible.builtin.command:
@@ -496,6 +560,30 @@
           register: upgrade_log
           changed_when: false
           failed_when: false
+
+        # An empty stdout from do-release-upgrade is normal — the
+        # non-interactive frontend logs to main.log instead of the terminal —
+        # so pull the actual error out rather than telling the operator to go
+        # and find it. Also report the log's age: main.log can be left over
+        # from an earlier attempt, and reading a stale one sends you chasing
+        # a problem you already fixed.
+        - name: Extract the error lines from the upgrader log
+          ansible.builtin.shell:
+            cmd: |
+              log=/var/log/dist-upgrade/main.log
+              [ -f "$log" ] || { echo "no main.log — the upgrader never started"; exit 0; }
+              echo "main.log last modified: $(date -r "$log" '+%Y-%m-%d %H:%M:%S') (now $(date '+%Y-%m-%d %H:%M:%S'))"
+              grep -iE 'error|exception|traceback|unresolvable|not authenticated|failed to|no space|aborting' \
+                "$log" | tail -n 25
+            executable: /bin/bash
+          register: upgrade_errors
+          changed_when: false
+          failed_when: false
+
+        - name: Show the errors found in the upgrader log
+          ansible.builtin.debug:
+            var: upgrade_errors.stdout_lines
+          when: upgrade_errors.stdout | default('') | trim | length > 0
 
         # On a fleet run the per-host output scrolls past; leave every failed
         # host's log on the controller under ./dist-upgrade-logs/<host>/.
