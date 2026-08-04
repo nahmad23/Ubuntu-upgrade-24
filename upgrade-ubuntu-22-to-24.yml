@@ -466,11 +466,49 @@
               (kernel {{ ansible_kernel }})
 
       rescue:
+        # An async job that ran out of time comes back with no rc at all, and
+        # that is a completely different problem from the upgrader exiting
+        # non-zero — one means "too slow", the other means "it refused".
+        # Say which, rather than making the operator guess.
+        - name: Summarise how do-release-upgrade ended
+          ansible.builtin.debug:
+            msg: >-
+              {{ ('do-release-upgrade did not finish within '
+                  ~ release_upgrade_timeout ~ 's and was abandoned (async '
+                  ~ 'timeout) — re-run with a larger -e release_upgrade_timeout '
+                  ~ 'if the host is simply slow.')
+                 if release_upgrade.rc is not defined
+                 else ('do-release-upgrade exited rc=' ~ release_upgrade.rc) }}
+          when: release_upgrade is defined
+
+        # The upgrader's own stdout usually names the blocker (unresolvable
+        # dependencies, a third-party repo, no space) more plainly than
+        # main.log does.
+        - name: Show the tail of the upgrader's own output
+          ansible.builtin.debug:
+            msg: "{{ (release_upgrade.stdout_lines | default([]))[-40:] +
+                     (release_upgrade.stderr_lines | default([]))[-40:] }}"
+          when: release_upgrade is defined
+
         - name: Collect the tail of the release upgrader log
           ansible.builtin.command:
             cmd: tail -n 80 /var/log/dist-upgrade/main.log
           register: upgrade_log
           changed_when: false
+          failed_when: false
+
+        # On a fleet run the per-host output scrolls past; leave every failed
+        # host's log on the controller under ./dist-upgrade-logs/<host>/.
+        - name: Retrieve the upgrader logs to the controller
+          ansible.builtin.fetch:
+            src: "/var/log/dist-upgrade/{{ item }}"
+            dest: "dist-upgrade-logs/"
+            flat: false
+            fail_on_missing: false
+          loop:
+            - main.log
+            - apt.log
+            - apt-term.log
           failed_when: false
 
         # Only when the upgrader actually got far enough to write one — a
