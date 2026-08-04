@@ -34,12 +34,21 @@
     rewrite_codename: true     # set false to re-enable without touching suites
     sources_dir: /etc/apt/sources.list.d
 
-    # Lines in apt-get update output that mean a repository is genuinely
-    # broken, rather than a cosmetic warning.
+    # Lines that mean a repository is genuinely unusable. apt reports a real
+    # signing failure as "E: The repository ... is not signed", so ^E: covers
+    # the unverifiable case without having to guess at wordings.
     apt_error_patterns:
       - '^Err:'
       - '^E: '
-      - '^W: .*(NO_PUBKEY|not signed|no longer signed|Key is stored in legacy)'
+
+    # Lines worth surfacing but NOT worth failing a host over. The legacy
+    # trusted.gpg deprecation is the big one: apt still uses those keys and
+    # the repository works, so treating it as an error fails every host that
+    # has an older internal mirror — a fleet-wide false positive.
+    apt_warning_patterns:
+      - '^W: .*Key is stored in legacy trusted\.gpg keyring'
+      - '^W: .*(NO_PUBKEY|not signed|no longer signed)'
+    fail_on_apt_warnings: false
 
   tasks:
 
@@ -142,6 +151,32 @@
     # -------------------------------------------------------------------
     # Verify every repository actually serves noble
     # -------------------------------------------------------------------
+    # apt does not support quoting the URI. It takes the quote as part of the
+    # scheme and reports the near-undebuggable
+    #   E: The method driver /usr/lib/apt/methods/"http could not be found
+    # so name the offending files rather than leaving that to be decoded.
+    - name: Look for source entries with a quoted URI
+      ansible.builtin.shell:
+        cmd: |
+          grep -rnE '^[[:space:]]*(deb|deb-src)[[:space:]]+"|^[[:space:]]*URIs:[[:space:]]*"' \
+            /etc/apt/sources.list {{ sources_dir }} 2>/dev/null || true
+        executable: /bin/bash
+      register: quoted_uris
+      changed_when: false
+      failed_when: false
+
+    - name: Report source entries whose URI is quoted
+      ansible.builtin.debug:
+        msg: |
+          These apt sources wrap the URI in double quotes, which apt does not
+          support. They will fail with 'The method driver
+          /usr/lib/apt/methods/"http could not be found' until the quotes go:
+          {{ quoted_uris.stdout | trim }}
+
+          Fix each file with:
+            sudo sed -i 's/"//g' <file>
+      when: quoted_uris.stdout | default('') | trim | length > 0
+
     - name: Refresh apt cache against the re-enabled repositories
       ansible.builtin.command:
         cmd: apt-get update
@@ -151,28 +186,65 @@
       changed_when: true
       failed_when: false
 
-    - name: Collect repositories that failed to update
+    - name: Sort the apt-get update output into errors and warnings
+      ansible.builtin.set_fact:
+        apt_output_lines: >-
+          {{ (apt_update.stdout_lines | default([]))
+             + (apt_update.stderr_lines | default([])) }}
+
+    - name: Split the errors from the advisory warnings
       ansible.builtin.set_fact:
         failed_repos: >-
-          {{ (apt_update.stdout_lines | default([]) + apt_update.stderr_lines | default([]))
-             | select('search', apt_error_patterns | join('|')) | list }}
+          {{ apt_output_lines | select('search', apt_error_patterns | join('|'))
+             | list }}
+        warned_repos: >-
+          {{ apt_output_lines | select('search', apt_warning_patterns | join('|'))
+             | list }}
 
-    # Must be a double-quoted YAML scalar: inside a literal block ("|") the
-    # \n stays a backslash-n and the report comes out on one run-together line.
-    - name: Render the failed repositories as one line each
+    # Must be double-quoted YAML scalars: inside a literal block ("|") the \n
+    # stays a backslash-n and the report comes out on one run-together line.
+    - name: Render each list as one line per entry
       ansible.builtin.set_fact:
         failed_repos_text: "{{ failed_repos | join('\n') }}"
+        warned_repos_text: "{{ warned_repos | join('\n') }}"
 
-    - name: Warn about repositories that do not serve {{ new_codename }} yet
+    # Reported, deliberately not fatal. The legacy trusted.gpg keyring is
+    # deprecated but still honoured by apt, so the repository works today —
+    # failing the host over it would fail every host with an older internal
+    # mirror. Set -e fail_on_apt_warnings=true to treat these as errors.
+    - name: Report advisory warnings from apt-get update
+      ansible.builtin.debug:
+        msg: |
+          apt-get update raised warnings on {{ inventory_hostname }}. These are
+          NOT failures — the repositories work — but they are worth scheduling:
+          {{ warned_repos_text }}
+
+          For "Key is stored in legacy trusted.gpg keyring", migrate the key:
+            sudo apt-key export <KEYID> | sudo gpg --dearmour \
+              -o /etc/apt/keyrings/<name>.gpg
+          then add signed-by=/etc/apt/keyrings/<name>.gpg to the source entry.
+      when: warned_repos | length > 0
+
+    - name: Fail on repositories that are genuinely broken
       ansible.builtin.fail:
         msg: |
-          apt-get update reported problems on {{ inventory_hostname }}.
-          These repositories likely do not publish {{ new_codename }} packages
-          yet (or their signing key needs re-importing) — fix or remove them
-          manually in {{ sources_dir }}/. A .bak of every file this playbook
-          touched is next to the original.
-          {{ failed_repos_text }}
-      when: apt_update.rc != 0 or failed_repos | length > 0
+          apt-get update reported errors on {{ inventory_hostname }}.
+          These repositories are unusable — they may not publish
+          {{ new_codename }} yet, may have a malformed source line, or may need
+          their signing key re-imported. Fix or remove them in
+          {{ sources_dir }}/. A .bak of every file this playbook touched is
+          next to the original.
+          {{ failed_repos_text | default('', true) | trim
+             | default('(apt-get update exited ' ~ apt_update.rc
+                       ~ ' without a recognisable error line — full output above)',
+                       true) }}
+      # rc is kept as a backstop so an error whose wording does not match
+      # apt_error_patterns still fails the host. apt-get update exits 0 when it
+      # only emits warnings, so this does not re-introduce the false positive.
+      when: >-
+        failed_repos | length > 0
+        or apt_update.rc != 0
+        or (fail_on_apt_warnings | bool and warned_repos | length > 0)
 
     - name: Report success
       ansible.builtin.debug:
