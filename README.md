@@ -46,6 +46,46 @@ Per host, in order:
    required, and **removes the temporary non-interactive overrides** it
    installed in step 2.
 
+## The `/usr` merge (a common hard blocker)
+
+Ubuntu 24.04 refuses to upgrade a host that still has the historical split
+layout, where `/bin`, `/sbin` and `/lib` are real directories rather than
+symlinks into `/usr`:
+
+```
+ERROR Cannot upgrade system with unmerged /usr
+```
+
+`do-release-upgrade` aborts about ten seconds in. Because the non-interactive
+frontend logs to `/var/log/dist-upgrade/main.log` rather than the terminal,
+the visible symptom is a bare `rc=1` with **completely empty output** — which
+is why this one is disproportionately hard to diagnose.
+
+Hosts whose lineage predates 22.04 (installed as 18.04/20.04 and upgraded
+since) are typically unmerged; images installed fresh as 22.04 already are.
+That's why it hits some of a fleet and not others.
+
+The playbook detects this and installs `usrmerge`, which performs the
+conversion, before starting the release upgrade. Survey your fleet first:
+
+```bash
+ansible ubuntu_servers -m shell -a \
+  'test -L /bin && echo merged || echo SPLIT-needs-usrmerge'
+```
+
+Two things worth knowing:
+
+- `convert-usrmerge` **makes no changes at all** when it finds a file present
+  in both `/lib` and `/usr/lib` (or `/bin` and `/usr/bin`). The package still
+  installs "successfully", so the playbook re-checks the layout afterwards and
+  fails the host rather than marching on into an upgrade that will abort.
+  Those duplicates have to be resolved by hand.
+- `usrmerge` lives in **universe** on some 22.04 images. If the install fails
+  with "no package matching", enable universe on that host first.
+
+Skip the whole step with `-e merge_usr=false`, which turns the situation into
+an explicit pre-flight failure instead.
+
 ## Answering prompts safely
 
 The upgrade is fully unattended, and every prompt is answered with the

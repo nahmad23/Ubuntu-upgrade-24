@@ -40,6 +40,7 @@
     lock_wait_timeout: 900               # 15 min waiting for the dpkg lock
     fail_on_held_packages: true          # held packages make the upgrader bail
     check_upgrade_tool_reachable: true   # verify archive.ubuntu.com is allowed
+    merge_usr: true                      # 24.04 refuses an unmerged /usr
     archive_check_url: ''                # empty => derive from the host's mirror
     archive_check_timeout: 15
 
@@ -396,6 +397,79 @@
             post_reboot_delay: 15
             msg: "Rebooting before Ubuntu release upgrade (Ansible)"
           when: reboot_required_pre.stat.exists
+
+        # ---------------------------------------------------------------
+        # STEP 1b — Merge /usr.
+        #
+        # Ubuntu 24.04 refuses to upgrade a host that still has the
+        # historical split layout (/bin, /sbin, /lib as real directories
+        # rather than symlinks into /usr):
+        #
+        #   ERROR Cannot upgrade system with unmerged /usr
+        #
+        # do-release-upgrade aborts about ten seconds in, and because the
+        # non-interactive frontend logs to main.log rather than stdout, the
+        # visible symptom is a bare rc=1 with no output.
+        #
+        # Hosts whose lineage predates 22.04 — installed as 18.04/20.04 and
+        # upgraded since — are typically unmerged. Images installed fresh as
+        # 22.04 are already merged, which is why this hits some of a fleet
+        # and not others.
+        #
+        # Installing usrmerge performs the conversion in its postinst. It is
+        # the fix Ubuntu's own upgrader tells you to apply, but it is still a
+        # real change to the filesystem layout, so it is switchable with
+        # -e merge_usr=false.
+        # ---------------------------------------------------------------
+        - name: Check whether /usr is already merged
+          ansible.builtin.stat:
+            path: /bin
+          register: bin_dir
+
+        - name: Abort if /usr is unmerged and merging was disabled
+          ansible.builtin.assert:
+            that:
+              - bin_dir.stat.islnk | default(false)
+            fail_msg: >-
+              {{ inventory_hostname }} still has the split /usr layout, which
+              Ubuntu 24.04 refuses to upgrade. Drop -e merge_usr=false to let
+              the playbook install usrmerge, or install it by hand first.
+          when: not (merge_usr | bool)
+
+        - name: Merge /usr by installing usrmerge
+          ansible.builtin.apt:
+            name: usrmerge
+            state: present
+            update_cache: true
+          environment: "{{ apt_noninteractive_env }}"
+          when:
+            - merge_usr | bool
+            - not (bin_dir.stat.islnk | default(false))
+          register: usrmerge_result
+
+        - name: Re-check the /usr layout after merging
+          ansible.builtin.stat:
+            path: /bin
+          register: bin_dir_post
+          when: usrmerge_result is changed
+
+        # convert-usrmerge deliberately makes no changes when it finds a file
+        # present in both /lib and /usr/lib, so a "successful" package install
+        # does not by itself prove the layout changed. Check the result.
+        - name: Confirm /usr really is merged now
+          ansible.builtin.assert:
+            that:
+              - bin_dir_post.stat.islnk | default(false)
+            fail_msg: >-
+              usrmerge was installed on {{ inventory_hostname }} but /bin is
+              still a real directory, so the conversion did not run to
+              completion. convert-usrmerge aborts without changing anything
+              when a file exists in both /lib and /usr/lib (or /bin and
+              /usr/bin) — resolve those duplicates by hand, then re-run.
+            success_msg: >-
+              /usr is now merged on {{ inventory_hostname }}
+              (/bin -> {{ bin_dir_post.stat.lnk_target | default('usr/bin') }}).
+          when: usrmerge_result is changed
 
         # ---------------------------------------------------------------
         # STEP 2 — Prepare the release upgrader for unattended operation
