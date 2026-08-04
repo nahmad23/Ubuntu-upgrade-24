@@ -245,6 +245,19 @@
               APT::Get::Assume-Yes "true";
               Dpkg::Use-Pty "0";
 
+        # needrestart is absent from minimal/cloud images, so this directory
+        # is not guaranteed to exist. Create it rather than skipping: the
+        # 22.04 -> 24.04 upgrade can pull needrestart in as a dependency, and
+        # pre-seeding the config means it is already governed by the time it
+        # first runs. dpkg unpacks happily into an existing directory.
+        - name: Ensure the needrestart drop-in directory exists
+          ansible.builtin.file:
+            path: "{{ needrestart_conf | dirname }}"
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
         - name: Install the temporary needrestart configuration
           ansible.builtin.copy:
             dest: "{{ needrestart_conf }}"
@@ -460,16 +473,24 @@
           changed_when: false
           failed_when: false
 
+        # Only when the upgrader actually got far enough to write one — a
+        # failure in the preparation steps has no dist-upgrade log, and
+        # pointing the operator at an empty directory wastes their time.
         - name: Show the release upgrader log tail
           ansible.builtin.debug:
             var: upgrade_log.stdout_lines
+          when: (upgrade_log.rc | default(1)) == 0
 
         - name: Fail the host after reporting the upgrade error
           ansible.builtin.fail:
             msg: >-
-              Upgrade failed on {{ inventory_hostname }}
-              ({{ ansible_failed_task.name | default('unknown task') }}).
-              Full logs are in /var/log/dist-upgrade/ on the host.
+              Upgrade failed on {{ inventory_hostname }} at task
+              "{{ ansible_failed_task.name | default('unknown') }}".
+              {{ 'See /var/log/dist-upgrade/ on the host for the upgrader log.'
+                 if (upgrade_log.rc | default(1)) == 0
+                 else 'The release upgrader had not started yet, so there is no
+                       /var/log/dist-upgrade log — the task error above is the
+                       whole story.' }}
 
       always:
         # Leaving force-confold in place permanently would silently keep stale
