@@ -384,16 +384,43 @@
       failed_when: false
       when: expected_repos | length > 0
 
-    - name: Work out which expected repositories are missing
+    # Match against BOTH the indextargets listing and the apt-get update
+    # output. The update output ("Hit:3 http://mirror/apt/foo noble InRelease")
+    # is what an operator reads when they say "this is our repo list", so
+    # expected_repos entries copied straight off an apt update on a known-good
+    # host match without translation. indextargets is kept as the second
+    # source because it still lists a repository that apt did not contact.
+    - name: Build the set of repositories this host actually has
       ansible.builtin.set_fact:
-        missing_repos: >-
-          {{ expected_repos | reject('in', configured_repos.stdout | default(''))
-             | list }}
+        repo_haystack: "{{ (apt_output_lines | default([]) | join('\n'))
+                           ~ '\n' ~ (configured_repos.stdout | default('')) }}"
       when: expected_repos | length > 0
 
-    - name: Show the repositories apt is configured against
+    # Without this the play reports every expected repository as missing when
+    # it is the enumeration that failed — blaming the repository set for a
+    # problem in the check itself.
+    - name: Fail if the repository set could not be determined at all
+      ansible.builtin.fail:
+        msg: |
+          Could not determine which repositories {{ inventory_hostname }} has,
+          so the expected-set check cannot be trusted.
+          apt-get indextargets exited
+          {{ configured_repos.rc | default('n/a') }}
+          {{ (configured_repos.stderr | default('')) | trim }}
+          and apt-get update produced
+          {{ apt_output_lines | default([]) | length }} lines.
+      when:
+        - expected_repos | length > 0
+        - repo_haystack | trim | length == 0
+
+    - name: Work out which expected repositories are missing
+      ansible.builtin.set_fact:
+        missing_repos: "{{ expected_repos | reject('in', repo_haystack) | list }}"
+      when: expected_repos | length > 0
+
+    - name: Show the repositories this host has
       ansible.builtin.debug:
-        var: configured_repos.stdout_lines
+        var: repo_haystack
       when: expected_repos | length > 0
 
     # Double-quoted scalars so \n is a real newline; inside the literal block
@@ -401,7 +428,8 @@
     - name: Render the repository comparison
       ansible.builtin.set_fact:
         missing_repos_text: "{{ missing_repos | default([]) | join('\n  ') }}"
-        configured_repos_text: "{{ configured_repos.stdout_lines | default([]) | join('\n  ') }}"
+        configured_repos_text: "{{ (repo_haystack | default('')).split('\n')
+                                   | select | list | join('\n  ') }}"
       when: expected_repos | length > 0
 
     - name: Fail if the host does not match the expected repository set
