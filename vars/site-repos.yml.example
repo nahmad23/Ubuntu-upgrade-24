@@ -63,3 +63,55 @@ expected_repos:
 # false — leave them disabled and only repoint what is already enabled
 # ---------------------------------------------------------------------------
 reenable_third_party: true
+
+# ---------------------------------------------------------------------------
+# 4. The source set deploy-apt-sources.yml writes.
+#
+# Take these VERBATIM from a reference host that is already correct:
+#
+#   for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+#     echo "### $f"; cat "$f"
+#   done
+#
+# Only *.list and *.sources are read by apt. Leftovers such as
+# *.distUpgrade, *.save and *.curtin.orig are inert and must NOT be listed
+# here — they exist as backups, and recreating them would be noise.
+#
+# Do not guess components. "main" versus "main restricted universe
+# multiverse" decides whether half your packages are installable, and it is
+# not visible in apt-get update output — copy the real line.
+# ---------------------------------------------------------------------------
+desired_apt_sources:
+  - path: ubuntu24.list
+    content: |
+      deb http://mirror.example.com/apt/ubuntu-stable noble main
+      deb http://mirror.example.com/apt/ubuntu-stable noble-updates main
+      deb http://mirror.example.com/apt/ubuntu-stable noble-security main
+
+  - path: fluent-bit.list
+    # Pinned to the vendor's jammy build path on purpose — there is no
+    # noble-4.0.0. Flat repo, hence the "./" and no components.
+    content: |
+      deb http://mirror.example.com/apt/fluentbit/jammy-4.0.0 ./
+
+  - path: hashicorp.list
+    content: |
+      deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com noble main
+
+  - path: ansible.list
+    content: |
+      deb http://ppa.launchpad.net/ansible/ansible/ubuntu noble main
+
+  - path: pbis-open.sources
+    content: |
+      Types: deb
+      URIs: http://mirror.example.com/apt/pbis-open
+      Suites: pbiso
+      Components: main
+
+  - path: zabbix.sources
+    content: |
+      Types: deb
+      URIs: http://mirror.example.com/apt/zabbix-6.0
+      Suites: noble
+      Components: main

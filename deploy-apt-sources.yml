@@ -1,0 +1,234 @@
+---
+# =============================================================================
+# Playbook : deploy-apt-sources.yml
+# Purpose  : Put a known-good APT source set onto hosts that have been
+#            upgraded to Ubuntu 24.04, so every server ends up with the same
+#            repository configuration as a reference host.
+#
+#            This is the declarative alternative to
+#            reenable-third-party-repos.yml. That playbook repairs whatever
+#            the upgrade left behind; this one states what the result should
+#            be and makes the host match. Use it when the upgrade lost the
+#            sources entirely, or when you want the fleet held to one
+#            definition rather than to whatever each host happened to have.
+#
+# Usage    : ansible-playbook deploy-apt-sources.yml -e @vars/site-repos.yml
+#            ansible-playbook deploy-apt-sources.yml -e @vars/site-repos.yml --check --diff
+#
+# The source set lives in desired_apt_sources (see vars/site-repos.yml.example).
+# Nothing is deployed unless that variable is populated — the playbook has no
+# built-in repository list, because a wrong URL is worse than none.
+# =============================================================================
+
+- name: Deploy the standard APT source set to upgraded Ubuntu 24.04 hosts
+  hosts: ubuntu_servers
+  become: true
+  serial: "{{ repo_batch | default('100%') }}"
+  max_fail_percentage: "{{ max_fail_pct | default(100) }}"
+  gather_facts: true
+
+  vars:
+    sources_dir: /etc/apt/sources.list.d
+    desired_apt_sources: []
+
+    # Move aside any *.list / *.sources that are not in desired_apt_sources.
+    # Off by default: on a mixed fleet a host may legitimately carry a repo
+    # the standard set does not name, and silently disabling it is worse than
+    # leaving it. Turn on once the standard set is known to be complete.
+    prune_unmanaged_sources: false
+
+    # Archive the whole directory before touching it. Cheap, and the one
+    # thing you want when a deployment turns out to be wrong.
+    backup_sources_dir: true
+    backup_dir: /var/backups/apt-sources
+
+    expected_repos: []
+    apt_error_patterns:
+      - '^Err:'
+      - '^E: '
+
+  tasks:
+
+    - name: Abort if host is not running Ubuntu 24.04
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version is version('24.04', '>=')
+        fail_msg: >-
+          {{ inventory_hostname }} reports {{ ansible_distribution }}
+          {{ ansible_distribution_version }}. Deploy 24.04 sources only to
+          hosts that are actually on 24.04 — run the upgrade playbook first.
+
+    - name: Refuse to run without a source set to deploy
+      ansible.builtin.assert:
+        that:
+          - desired_apt_sources | length > 0
+        fail_msg: >-
+          desired_apt_sources is empty, so there is nothing to deploy. Fill it
+          in (see vars/site-repos.yml.example) and pass it with
+          -e @vars/site-repos.yml. This playbook deliberately ships no default
+          repository list: a wrong mirror URL is worse than no deployment.
+
+    # -------------------------------------------------------------------
+    # Back up whatever is there now
+    # -------------------------------------------------------------------
+    - name: Ensure the backup directory exists
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: backup_sources_dir | bool
+
+    - name: Archive the current source configuration
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          stamp=$(date +%Y%m%d-%H%M%S)
+          tar czf "{{ backup_dir }}/apt-sources-${stamp}.tar.gz" \
+            -C / etc/apt/sources.list etc/apt/sources.list.d 2>/dev/null || true
+          echo "{{ backup_dir }}/apt-sources-${stamp}.tar.gz"
+        executable: /bin/bash
+      register: sources_backup
+      changed_when: true
+      when: backup_sources_dir | bool
+
+    - name: Report where the backup went
+      ansible.builtin.debug:
+        msg: "Previous source configuration archived to {{ sources_backup.stdout | trim }}"
+      when: backup_sources_dir | bool
+
+    # -------------------------------------------------------------------
+    # Deploy the standard set
+    # -------------------------------------------------------------------
+    - name: Ensure the sources directory exists
+      ansible.builtin.file:
+        path: "{{ sources_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    # A missing trailing newline on the last deb line is a classic way to
+    # lose a repository silently, so content is normalised with one.
+    - name: Deploy each source file
+      ansible.builtin.copy:
+        dest: "{{ sources_dir }}/{{ item.path }}"
+        content: "{{ item.content | trim }}\n"
+        owner: root
+        group: root
+        mode: '0644'
+        backup: true
+      loop: "{{ desired_apt_sources }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: deployed_sources
+
+    # -------------------------------------------------------------------
+    # Optionally retire anything not in the standard set
+    # -------------------------------------------------------------------
+    - name: Find source files that are not part of the standard set
+      ansible.builtin.find:
+        paths: "{{ sources_dir }}"
+        patterns:
+          - '*.list'
+          - '*.sources'
+        file_type: file
+      register: present_sources
+      when: prune_unmanaged_sources | bool
+
+    - name: Work out which files are unmanaged
+      ansible.builtin.set_fact:
+        unmanaged_sources: >-
+          {{ present_sources.files | map(attribute='path') | list
+             | difference(desired_apt_sources
+                          | map(attribute='path')
+                          | map('regex_replace', '^', sources_dir ~ '/')
+                          | list) }}
+      when: prune_unmanaged_sources | bool
+
+    # Renamed rather than deleted: apt ignores anything not ending .list or
+    # .sources, so this disables the repository while leaving it recoverable.
+    - name: Retire unmanaged source files
+      ansible.builtin.command:
+        cmd: mv "{{ item }}" "{{ item }}.unmanaged"
+        removes: "{{ item }}"
+      loop: "{{ unmanaged_sources | default([]) }}"
+      when: prune_unmanaged_sources | bool
+
+    - name: Report retired files
+      ansible.builtin.debug:
+        msg: |
+          These sources were not in the standard set and have been renamed
+          to *.unmanaged (apt ignores them; rename back to restore):
+            {{ unmanaged_sources | join(', ') }}
+      when:
+        - prune_unmanaged_sources | bool
+        - unmanaged_sources | default([]) | length > 0
+
+    # -------------------------------------------------------------------
+    # Prove it works
+    # -------------------------------------------------------------------
+    - name: Refresh the apt cache against the deployed sources
+      ansible.builtin.command:
+        cmd: apt-get update
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: apt_update
+      changed_when: true
+      failed_when: false
+
+    - name: Collect repositories that failed
+      ansible.builtin.set_fact:
+        failed_repos: >-
+          {{ ((apt_update.stdout_lines | default([]))
+              + (apt_update.stderr_lines | default([])))
+             | select('search', apt_error_patterns | join('|')) | list }}
+
+    - name: Render the failures
+      ansible.builtin.set_fact:
+        failed_repos_text: "{{ failed_repos | join('\n  ') }}"
+
+    - name: Show what apt now sees
+      ansible.builtin.debug:
+        var: apt_update.stdout_lines
+
+    - name: Fail if any deployed repository is unusable
+      ansible.builtin.fail:
+        msg: |
+          apt-get update failed against the deployed sources on
+          {{ inventory_hostname }}:
+            {{ failed_repos_text }}
+          The previous configuration is in
+          {{ sources_backup.stdout | default('(no backup taken)') | trim }}
+          and each replaced file also has a .bak alongside it.
+      when: failed_repos | length > 0 or apt_update.rc != 0
+
+    - name: Verify the expected repositories are present
+      ansible.builtin.set_fact:
+        apt_update_text: "{{ (apt_update.stdout_lines | default([])) | join('\n') }}"
+      when: expected_repos | length > 0
+
+    - name: Work out which expected repositories are absent
+      ansible.builtin.set_fact:
+        missing_repos: "{{ expected_repos | reject('in', apt_update_text) | list }}"
+        missing_repos_text: "{{ expected_repos | reject('in', apt_update_text)
+                                | list | join('\n  ') }}"
+      when: expected_repos | length > 0
+
+    - name: Fail if an expected repository is absent
+      ansible.builtin.fail:
+        msg: |
+          {{ inventory_hostname }} deployed cleanly but is missing expected
+          repositories:
+            {{ missing_repos_text }}
+      when:
+        - expected_repos | length > 0
+        - missing_repos | default([]) | length > 0
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ desired_apt_sources | length }} source
+          file(s) deployed and all repositories resolving.

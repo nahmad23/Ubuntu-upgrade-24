@@ -147,6 +147,33 @@ ansible-playbook upgrade-ubuntu-22-to-24.yml --limit server01.example.com,server
 4. **Check `ansible-upgrade.log`** (written by `ansible.cfg`) and, on any
    failed host, `/var/log/dist-upgrade/` for the upgrader's own logs.
 
+## Step 2 (alternative): Deploy a standard source set
+
+`reenable-third-party-repos.yml` repairs whatever the upgrade left behind.
+When the upgrade lost the sources entirely, or you want every server held to
+one definition rather than to whatever each host happened to have, use the
+declarative playbook instead:
+
+```bash
+cp vars/site-repos.yml.example vars/site-repos.yml   # then fill it in
+ansible-playbook deploy-apt-sources.yml -e @vars/site-repos.yml --check --diff
+ansible-playbook deploy-apt-sources.yml -e @vars/site-repos.yml
+```
+
+It archives the current configuration to `/var/backups/apt-sources/` first,
+writes each file from `desired_apt_sources`, runs `apt-get update`, and fails
+the host if any deployed repository is unusable. `-e prune_unmanaged_sources=true`
+additionally renames any source file **not** in the standard set to
+`*.unmanaged` — apt ignores that extension, so the repository is disabled but
+recoverable by renaming it back.
+
+The playbook ships **no** default repository list. A wrong mirror URL is worse
+than no deployment, so `desired_apt_sources` must be populated from a
+reference host — take the file contents verbatim rather than reconstructing
+them, because components (`main` vs `main restricted universe multiverse`)
+decide whether half your packages are installable and are not visible in
+`apt-get update` output.
+
 ## Step 2: Re-enable third-party repositories
 
 `do-release-upgrade` disables every third-party APT source (PPAs, Docker,
