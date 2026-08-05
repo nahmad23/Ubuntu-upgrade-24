@@ -373,11 +373,30 @@
     # which is the honest answer — it reflects the merged effect of
     # sources.list, sources.list.d and any deb822 stanzas, rather than what
     # the files look like.
-    - name: Enumerate the repositories apt is configured against
+    # Three independent sources, because each can come up empty on its own:
+    #   1. indextargets — authoritative and covers deb822, but returns nothing
+    #      if apt cannot read its lists.
+    #   2. the raw source lines — always present, and an expected_repos entry
+    #      like "apt/ubuntu-stable noble" matches the deb line directly.
+    #   3. deb822 stanzas flattened to "URI suite", since 2 cannot see those.
+    # Whatever apt-get update did or did not print, one of these has the answer.
+    - name: Enumerate the repositories this host has configured
       ansible.builtin.shell:
         cmd: |
-          apt-get indextargets --no-release-info --format '$(SITE) $(RELEASE)' \
-            | sort -u
+          apt-get indextargets --format '$(SITE) $(RELEASE)' 2>/dev/null | sort -u
+          grep -rhE '^[[:space:]]*deb(-src)?[[:space:]]' \
+            /etc/apt/sources.list {{ sources_dir }} 2>/dev/null
+          awk '
+            /^[Uu][Rr][Ii][Ss]:/    { for (i=2;i<=NF;i++) uris[++u]=$i; next }
+            /^[Ss][Uu][Ii][Tt][Ee][Ss]:/ { for (i=2;i<=NF;i++) suites[++s]=$i; next }
+            /^[[:space:]]*$/ {
+              for (a=1;a<=u;a++) for (b=1;b<=s;b++) print uris[a], suites[b]
+              u=0; s=0; delete uris; delete suites; next
+            }
+            END {
+              for (a=1;a<=u;a++) for (b=1;b<=s;b++) print uris[a], suites[b]
+            }
+          ' {{ sources_dir }}/*.sources 2>/dev/null
         executable: /bin/bash
       register: configured_repos
       changed_when: false
@@ -399,19 +418,33 @@
     # Without this the play reports every expected repository as missing when
     # it is the enumeration that failed — blaming the repository set for a
     # problem in the check itself.
+    # Count lines that actually look like a repository, not just any text:
+    # a bare "Reading package lists..." is not evidence of anything, and
+    # treating it as a populated haystack is what made the check report every
+    # expected repository as missing.
+    - name: Count how many repository-shaped lines were found
+      ansible.builtin.set_fact:
+        repo_evidence: >-
+          {{ repo_haystack.split('\n') | select('search', '://') | list }}
+      when: expected_repos | length > 0
+
     - name: Fail if the repository set could not be determined at all
       ansible.builtin.fail:
         msg: |
           Could not determine which repositories {{ inventory_hostname }} has,
-          so the expected-set check cannot be trusted.
-          apt-get indextargets exited
-          {{ configured_repos.rc | default('n/a') }}
-          {{ (configured_repos.stderr | default('')) | trim }}
-          and apt-get update produced
-          {{ apt_output_lines | default([]) | length }} lines.
+          so the expected-set check cannot be trusted — this is a problem with
+          the check, not necessarily with the host.
+          apt-get indextargets and the source-file scan exited
+          rc={{ configured_repos.rc | default('n/a') }}
+          stderr: {{ (configured_repos.stderr | default('')) | trim }}
+          apt-get update produced {{ apt_output_lines | default([]) | length }}
+          line(s), none of them naming a repository.
+          Run this on the host to see what it has:
+            apt-get indextargets --format '$(SITE) $(RELEASE)'
+            grep -rhE '^[[:space:]]*deb' /etc/apt/sources.list {{ sources_dir }}
       when:
         - expected_repos | length > 0
-        - repo_haystack | trim | length == 0
+        - repo_evidence | length == 0
 
     - name: Work out which expected repositories are missing
       ansible.builtin.set_fact:
