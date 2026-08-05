@@ -43,6 +43,11 @@
     # codename. Independent of reenable_third_party, and the part that
     # matters when third-party repos are staying disabled.
     rewrite_enabled_sources: true
+
+    # Repair source lines that wrap the URI in double quotes. apt has never
+    # supported that, so such an entry is unambiguously malformed and blocks
+    # apt-get update entirely. Set false to only report them.
+    fix_quoted_uris: true
     sources_dir: /etc/apt/sources.list.d
 
     # Lines that mean a repository is genuinely unusable. apt reports a real
@@ -206,24 +211,51 @@
     - name: Look for source entries with a quoted URI
       ansible.builtin.shell:
         cmd: |
-          grep -rnE '^[[:space:]]*(deb|deb-src)[[:space:]]+"|^[[:space:]]*URIs:[[:space:]]*"' \
+          grep -rlE '^[[:space:]]*(deb|deb-src)[[:space:]]+.*"|^[[:space:]]*URIs:[[:space:]]*"' \
             /etc/apt/sources.list {{ sources_dir }} 2>/dev/null || true
         executable: /bin/bash
       register: quoted_uris
       changed_when: false
       failed_when: false
 
-    - name: Report source entries whose URI is quoted
+    - name: Record which files carry a quoted URI
+      ansible.builtin.set_fact:
+        quoted_uri_paths: "{{ quoted_uris.stdout_lines | default([]) | select | list }}"
+
+    # Surgical, not a blanket quote strip: only the URI field on deb/deb-src
+    # lines and on deb822 URIs: lines. Neither format uses quotes for anything
+    # legitimate, but a whole-file sed would also hit option values and
+    # comments. Backups are kept next to each file.
+    - name: Unquote the URI on one-line deb entries
+      ansible.builtin.replace:
+        path: "{{ item }}"
+        regexp: '^([ \t]*deb(?:-src)?[ \t]+(?:\[[^\]]*\][ \t]*)?)"([^"]*)"'
+        replace: '\1\2'
+        backup: true
+      loop: "{{ quoted_uri_paths }}"
+      when: fix_quoted_uris | bool
+
+    - name: Unquote the URI on deb822 entries
+      ansible.builtin.replace:
+        path: "{{ item }}"
+        regexp: '^([ \t]*URIs:[ \t]*)"([^"]*)"'
+        replace: '\1\2'
+        backup: true
+      loop: "{{ quoted_uri_paths }}"
+      when: fix_quoted_uris | bool
+
+    - name: Report the source files whose URI was quoted
       ansible.builtin.debug:
         msg: |
-          These apt sources wrap the URI in double quotes, which apt does not
-          support. They will fail with 'The method driver
-          /usr/lib/apt/methods/"http could not be found' until the quotes go:
-          {{ quoted_uris.stdout | trim }}
-
-          Fix each file with:
-            sudo sed -i 's/"//g' <file>
-      when: quoted_uris.stdout | default('') | trim | length > 0
+          These apt sources wrapped the URI in double quotes, which apt does
+          not support - it reads the quote as part of the scheme and reports
+          'The method driver /usr/lib/apt/methods/"http could not be found':
+            {{ quoted_uri_paths | join(', ') }}
+          {{ 'They have been repaired (a .bak of each is alongside).'
+             if (fix_quoted_uris | bool)
+             else 'fix_quoted_uris is false, so they were left as-is and
+                   apt-get update will fail on them.' }}
+      when: quoted_uri_paths | length > 0
 
     - name: Refresh apt cache against the re-enabled repositories
       ansible.builtin.command:

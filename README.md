@@ -192,6 +192,13 @@ a fixed suite (e.g. Google Chrome's `stable`) are re-enabled but not
 rewritten. Use `-e rewrite_codename=false` if you want to re-enable
 without touching suites at all.
 
+It also repairs source lines that wrap the URI in double quotes — apt has
+never supported that and fails the whole `apt-get update` with the opaque
+`E: The method driver /usr/lib/apt/methods/"http could not be found`. Only the
+URI field on `deb`/`deb-src` and deb822 `URIs:` lines is touched, so option
+blocks like `[arch=amd64 signed-by=...]` survive intact. Use
+`-e fix_quoted_uris=false` to report them without changing anything.
+
 Every file it edits is backed up alongside the original, so a bad rewrite is
 easy to undo. The codename rewrite deliberately skips signing-key filenames —
 `signed-by=/usr/share/keyrings/jammy-archive.gpg` keeps its name, because
