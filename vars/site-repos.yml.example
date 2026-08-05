@@ -90,9 +90,11 @@ desired_apt_sources:
 
   - path: fluent-bit.list
     # Pinned to the vendor's jammy build path on purpose — there is no
-    # noble-4.0.0. Flat repo, hence the "./" and no components.
+    # noble-4.0.0. Flat repo, hence the "./" and no components. [trusted=yes]
+    # because the vendor publishes it unsigned, which is why apt shows it as
+    # Ign: rather than Hit: — that is expected, not a failure.
     content: |
-      deb http://mirror.example.com/apt/fluentbit/jammy-4.0.0 ./
+      deb [trusted=yes] http://mirror.example.com/apt/fluentbit/jammy-4.0.0 ./
 
   - path: hashicorp.list
     content: |
@@ -100,7 +102,23 @@ desired_apt_sources:
 
   - path: ansible.list
     content: |
-      deb http://ppa.launchpad.net/ansible/ansible/ubuntu noble main
+      deb [signed-by=/usr/share/keyrings/ansible-archive-keyring.gpg] http://ppa.launchpad.net/ansible/ansible/ubuntu noble main
+
+  # A deb822 entry can carry its signing key inline instead of pointing at a
+  # keyring file. Keep the single-space indent on every continuation line and
+  # the " ." that marks a blank line inside the folded field — a YAML literal
+  # block preserves both exactly.
+  # - path: example-ppa.sources
+  #   content: |
+  #     Types: deb
+  #     URIs: https://ppa.launchpadcontent.net/example/ppa/ubuntu/
+  #     Suites: noble
+  #     Components: main
+  #     Signed-By: -----BEGIN PGP PUBLIC KEY BLOCK-----
+  #      .
+  #      mQINBFOXbTABEADKLcY3MYZyHIiCEu8cQ+0UzxZolTYZf8xZ06/d8xzUW/UBPTLV
+  #      =qlCh
+  #      -----END PGP PUBLIC KEY BLOCK-----
 
   - path: pbis-open.sources
     content: |

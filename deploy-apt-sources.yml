@@ -126,6 +126,43 @@
       register: deployed_sources
 
     # -------------------------------------------------------------------
+    # Check the keyrings those sources depend on
+    # -------------------------------------------------------------------
+    # A source can name a keyring two ways: signed-by=/path in a one-line
+    # entry, or "Signed-By: /path" in deb822 (a deb822 entry may instead carry
+    # the key inline, which needs no file). If the file is missing the repo
+    # fails to verify — and on an upgraded host it is exactly the kind of
+    # thing that gets lost, so check rather than assume.
+    - name: Collect the keyring paths the deployed sources reference
+      ansible.builtin.set_fact:
+        referenced_keyrings: >-
+          {{ desired_apt_sources
+             | map(attribute='content') | join('\n')
+             | regex_findall('(?:signed-by=|Signed-By:[ \t]*)(/[^\s\]]+)')
+             | unique | list }}
+
+    - name: Check each referenced keyring exists
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ referenced_keyrings }}"
+      register: keyring_stat
+
+    - name: Fail if a source names a keyring the host does not have
+      ansible.builtin.assert:
+        that:
+          - keyring_stat.results | rejectattr('stat.exists') | list | length == 0
+        fail_msg: >-
+          These sources reference keyrings that do not exist on
+          {{ inventory_hostname }}, so those repositories cannot be verified:
+          {{ keyring_stat.results | rejectattr('stat.exists')
+             | map(attribute='item') | list | join(', ') }}.
+          Copy the keyring across from a working host, or switch the entry to
+          an inline deb822 Signed-By key.
+        success_msg: >-
+          All {{ referenced_keyrings | length }} referenced keyring(s) present.
+      when: referenced_keyrings | length > 0
+
+    # -------------------------------------------------------------------
     # Optionally retire anything not in the standard set
     # -------------------------------------------------------------------
     - name: Find source files that are not part of the standard set
