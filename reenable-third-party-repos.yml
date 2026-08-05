@@ -383,20 +383,30 @@
     - name: Enumerate the repositories this host has configured
       ansible.builtin.shell:
         cmd: |
-          apt-get indextargets --format '$(SITE) $(RELEASE)' 2>/dev/null | sort -u
-          grep -rhE '^[[:space:]]*deb(-src)?[[:space:]]' \
-            /etc/apt/sources.list {{ sources_dir }} 2>/dev/null
-          awk '
-            /^[Uu][Rr][Ii][Ss]:/    { for (i=2;i<=NF;i++) uris[++u]=$i; next }
-            /^[Ss][Uu][Ii][Tt][Ee][Ss]:/ { for (i=2;i<=NF;i++) suites[++s]=$i; next }
-            /^[[:space:]]*$/ {
-              for (a=1;a<=u;a++) for (b=1;b<=s;b++) print uris[a], suites[b]
-              u=0; s=0; delete uris; delete suites; next
-            }
-            END {
-              for (a=1;a<=u;a++) for (b=1;b<=s;b++) print uris[a], suites[b]
-            }
-          ' {{ sources_dir }}/*.sources 2>/dev/null
+          # nullglob so an empty sources.list.d makes the loops no-ops rather
+          # than passing a literal "*.sources" to awk, which exits 2 and
+          # (being last) made the whole task look like it had failed.
+          shopt -s nullglob
+          apt-get indextargets --format '$(SITE) $(RELEASE)' 2>/dev/null | sort -u || true
+          for f in /etc/apt/sources.list {{ sources_dir }}/*.list; do
+            [ -f "$f" ] || continue
+            grep -hE '^[[:space:]]*deb(-src)?[[:space:]]' "$f" 2>/dev/null || true
+          done
+          for f in {{ sources_dir }}/*.sources; do
+            [ -f "$f" ] || continue
+            awk '
+              /^[Uu][Rr][Ii][Ss]:/         { for (i=2;i<=NF;i++) uris[++u]=$i; next }
+              /^[Ss][Uu][Ii][Tt][Ee][Ss]:/ { for (i=2;i<=NF;i++) suites[++s]=$i; next }
+              /^[[:space:]]*$/ {
+                for (a=1;a<=u;a++) for (b=1;b<=s;b++) print uris[a], suites[b]
+                u=0; s=0; delete uris; delete suites; next
+              }
+              END {
+                for (a=1;a<=u;a++) for (b=1;b<=s;b++) print uris[a], suites[b]
+              }
+            ' "$f" 2>/dev/null || true
+          done
+          exit 0
         executable: /bin/bash
       register: configured_repos
       changed_when: false
@@ -428,20 +438,49 @@
           {{ repo_haystack.split('\n') | select('search', '://') | list }}
       when: expected_repos | length > 0
 
-    - name: Fail if the repository set could not be determined at all
+    # Zero repositories is not "the check could not tell" — it is a real and
+    # serious state: the host cannot install or update anything, including
+    # security updates. Look for the backups worth restoring from before
+    # reporting it, so the message carries the recovery options.
+    - name: Look for source files that could be restored
+      ansible.builtin.shell:
+        cmd: |
+          shopt -s nullglob
+          for f in /etc/apt/sources.list /etc/apt/sources.list.* \
+                   {{ sources_dir }}/* {{ sources_dir }}/.*; do
+            [ -f "$f" ] && printf '%s (%s bytes)\n' "$f" "$(stat -c%s "$f")"
+          done
+          exit 0
+        executable: /bin/bash
+      register: source_backups
+      changed_when: false
+      failed_when: false
+      when:
+        - expected_repos | length > 0
+        - repo_evidence | length == 0
+
+    - name: Render the restore candidates
+      ansible.builtin.set_fact:
+        source_backups_text: "{{ (source_backups.stdout_lines | default(['(none found)']))
+                                 | join('\n    ') }}"
+      when:
+        - expected_repos | length > 0
+        - repo_evidence | length == 0
+
+    - name: Fail because the host has no APT repositories configured
       ansible.builtin.fail:
         msg: |
-          Could not determine which repositories {{ inventory_hostname }} has,
-          so the expected-set check cannot be trusted — this is a problem with
-          the check, not necessarily with the host.
-          apt-get indextargets and the source-file scan exited
-          rc={{ configured_repos.rc | default('n/a') }}
-          stderr: {{ (configured_repos.stderr | default('')) | trim }}
-          apt-get update produced {{ apt_output_lines | default([]) | length }}
-          line(s), none of them naming a repository.
-          Run this on the host to see what it has:
-            apt-get indextargets --format '$(SITE) $(RELEASE)'
-            grep -rhE '^[[:space:]]*deb' /etc/apt/sources.list {{ sources_dir }}
+          {{ inventory_hostname }} has NO apt repositories configured — the
+          scan of /etc/apt/sources.list and {{ sources_dir }} found no deb
+          entries, and apt-get indextargets returned nothing. A host in this
+          state cannot install or update anything, including security updates.
+
+          This is not the expected-set check being wrong; there is genuinely
+          nothing for apt to read.
+
+          Files present under /etc/apt (restore candidates — do-release-upgrade
+          leaves *.distUpgrade and *.save, this playbook leaves *.bak):
+            {{ source_backups_text }}
       when:
         - expected_repos | length > 0
         - repo_evidence | length == 0
