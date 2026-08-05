@@ -32,6 +32,17 @@
     old_codename: jammy
     new_codename: noble
     rewrite_codename: true     # set false to re-enable without touching suites
+
+    # Whether to switch the upgrader-disabled third-party sources back on.
+    # Set false to leave them off and only make the repositories that are
+    # already enabled serve the new release:
+    #   ansible-playbook reenable-third-party-repos.yml -e reenable_third_party=false
+    reenable_third_party: true
+
+    # Repoint sources that are already enabled but still name the old
+    # codename. Independent of reenable_third_party, and the part that
+    # matters when third-party repos are staying disabled.
+    rewrite_enabled_sources: true
     sources_dir: /etc/apt/sources.list.d
 
     # Lines that mean a repository is genuinely unusable. apt reports a real
@@ -81,7 +92,7 @@
         regexp: '^#[ \t]*(deb(?:-src)?[ \t]+[^#\n]*?)[ \t]*#[ \t]*disabled on upgrade to[ \t]+\S+[ \t]*$'
         replace: '\1'
         backup: true
-      loop: "{{ disabled_list_files.files }}"
+      loop: "{{ disabled_list_files.files if (reenable_third_party | bool) else [] }}"
       loop_control:
         label: "{{ item.path }}"
 
@@ -103,13 +114,26 @@
         regexp: '^Enabled:[ \t]*no[ \t]*$'
         replace: 'Enabled: yes'
         backup: true
-      loop: "{{ disabled_sources_files.files }}"
+      loop: "{{ disabled_sources_files.files if (reenable_third_party | bool) else [] }}"
       loop_control:
         label: "{{ item.path }}"
 
     - name: Collect every file we re-enabled
       ansible.builtin.set_fact:
-        reenabled_files: "{{ disabled_list_files.files + disabled_sources_files.files }}"
+        reenabled_files: >-
+          {{ (disabled_list_files.files + disabled_sources_files.files)
+             if (reenable_third_party | bool) else [] }}
+
+    - name: Report the disabled repositories that were deliberately left off
+      ansible.builtin.debug:
+        msg: |
+          reenable_third_party is false, so these upgrader-disabled sources
+          were left disabled on {{ inventory_hostname }}:
+          {{ (disabled_list_files.files + disabled_sources_files.files)
+             | map(attribute='path') | list | join(', ') }}
+      when:
+        - not (reenable_third_party | bool)
+        - (disabled_list_files.files + disabled_sources_files.files) | length > 0
 
     # Runs over both formats: a .list file can carry the marker on its own
     # line as well as inline, and the inline form is already gone by now.
@@ -130,23 +154,47 @@
     # "noble-archive.gpg", or the repo ends up pointing at a keyring that
     # does not exist. Suites (jammy, jammy-updates) and codenames embedded
     # in URLs are still rewritten.
-    - name: Rewrite suite {{ old_codename }} -> {{ new_codename }} in re-enabled files
+    # Repositories that are ALREADY enabled but still name the old codename:
+    # these are left behind by an upgrade regardless of whether anything was
+    # re-enabled, and they are the ones that matter when third-party repos are
+    # deliberately staying off. ^[^#] restricts the match to active lines, so
+    # commented-out entries are not resurrected by a codename rewrite.
+    - name: Find enabled sources still pointing at {{ old_codename }}
+      ansible.builtin.find:
+        paths: "{{ sources_dir }}"
+        patterns:
+          - '*.list'
+          - '*.sources'
+        file_type: file
+        contains: '^[^#]*\b{{ old_codename }}\b'
+      register: stale_codename_files
+      when: rewrite_enabled_sources | bool
+
+    # Dedupe on the path, not the dict: the two find calls return the same
+    # file with different mtime/checksum metadata, so `unique` over the dicts
+    # would leave a duplicate and rewrite it twice.
+    - name: Build the list of files to repoint at {{ new_codename }}
+      ansible.builtin.set_fact:
+        rewrite_targets: >-
+          {{ (reenabled_files + (stale_codename_files.files | default([])))
+             | map(attribute='path') | unique | list }}
+
+    - name: Rewrite suite {{ old_codename }} -> {{ new_codename }}
       ansible.builtin.replace:
-        path: "{{ item.path }}"
+        path: "{{ item }}"
         regexp: '\b{{ old_codename }}\b(?![\w.+-]*\.(?:gpg|asc|key|pgp))'
         replace: '{{ new_codename }}'
         backup: true
-      loop: "{{ reenabled_files }}"
-      loop_control:
-        label: "{{ item.path }}"
+      loop: "{{ rewrite_targets }}"
       when: rewrite_codename | bool
 
-    - name: Show what was re-enabled on this host
+    - name: Show what changed on this host
       ansible.builtin.debug:
-        msg: >-
-          Re-enabled
-          {{ reenabled_files | map(attribute='path') | list
-             | default(['nothing — no disabled sources found'], true) }}
+        msg: |
+          Re-enabled: {{ reenabled_files | map(attribute='path') | list
+                         | default(['nothing'], true) }}
+          Repointed at {{ new_codename }}:
+            {{ rewrite_targets | default(['nothing'], true) }}
 
     # -------------------------------------------------------------------
     # Verify every repository actually serves noble

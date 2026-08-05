@@ -159,6 +159,30 @@ ansible-playbook reenable-third-party-repos.yml
 ansible-playbook reenable-third-party-repos.yml -e repo_batch=25%
 ```
 
+### Leaving third-party repos disabled
+
+If you would rather **not** switch the vendor repos back on, and only need the
+repositories that are already enabled to serve `noble`:
+
+```bash
+ansible-playbook reenable-third-party-repos.yml -e reenable_third_party=false
+```
+
+In that mode the playbook:
+
+- leaves every source the upgrader disabled **disabled**, and prints which
+  ones so the decision is visible in the run output;
+- repoints sources that are **already enabled** but still name `jammy` — this
+  is what `rewrite_enabled_sources` controls, and it is independent of
+  `reenable_third_party`;
+- leaves fixed suites (`stable`, and vendor suites like `pbiso`) alone,
+  because there is no codename in them to rewrite;
+- still runs `apt-get update` and fails the host on any repository that is
+  genuinely broken.
+
+Commented-out entries are never resurrected by the codename rewrite: the
+search is anchored to active (non-`#`) lines only.
+
 It finds everything the upgrader disabled in `/etc/apt/sources.list.d/`
 (both classic `.list` files and deb822 `.sources` files), re-enables the
 entries, rewrites the suite `jammy` → `noble`, then runs `apt-get update`
