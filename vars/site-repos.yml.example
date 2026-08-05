@@ -1,0 +1,65 @@
+---
+# =============================================================================
+# Site repository policy for reenable-third-party-repos.yml
+#
+# Copy to vars/site-repos.yml, fill in your own values, and pass it with:
+#   ansible-playbook reenable-third-party-repos.yml -e @vars/site-repos.yml
+#
+# vars/site-repos.yml is gitignored, because a repository set names your
+# internal mirror hosts.
+#
+# Build the values from a server that is ALREADY on 24.04 and known good:
+#   apt-get indextargets --no-release-info --format '$(SITE) $(RELEASE)' | sort -u
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Sources whose codename must NOT be rewritten jammy -> noble.
+#
+# Regexes matched against the source FILE PATH.
+#
+# Some vendors pin the release codename into the repository path as part of a
+# build identifier, for example:
+#
+#   deb http://mirror.example.com/apt/fluentbit/jammy-4.0.0 ./
+#
+# There is no "noble-4.0.0" to move to — that vendor simply publishes one
+# build and 24.04 hosts keep using the jammy-named path. Rewriting it points
+# the host at a URL that does not exist, and because the entry is a flat repo
+# ("./") apt reports it as Ign rather than a hard error, so it fails quietly.
+#
+# This cannot be detected automatically: "jammy-4.0.0" and "jammy-updates" are
+# the same shape, and the first must be left alone while the second must be
+# rewritten. List the exceptions explicitly.
+# ---------------------------------------------------------------------------
+codename_rewrite_exclude:
+  - 'fluentbit'
+  # - 'some-other-vendor'
+
+# ---------------------------------------------------------------------------
+# 2. The repository set an upgraded host must end up with.
+#
+# Each entry is a substring matched against "SITE SUITE" from
+# apt-get indextargets. Keep them short and unambiguous — the mirror path plus
+# the suite is enough. A host missing any of these fails the play.
+#
+# Note the mix that is normal after an upgrade:
+#   * the OS mirror moves to noble / noble-updates / noble-security
+#   * vendor repos with their own suite (pbiso) keep it
+#   * vendor repos with a pinned path keep the old codename (see above)
+# ---------------------------------------------------------------------------
+expected_repos:
+  - 'apt/ubuntu-stable noble'
+  - 'apt/ubuntu-stable noble-updates'
+  - 'apt/ubuntu-stable noble-security'
+  # - 'apt/zabbix-6.0 noble'
+  # - 'apt/pbis-open pbiso'
+  # - 'apt.releases.hashicorp.com noble'
+  # - 'ansible/ubuntu noble'
+
+# ---------------------------------------------------------------------------
+# 3. Whether the upgrader-disabled third-party repos come back on.
+#
+# true  — restore them (they are part of the expected set above)
+# false — leave them disabled and only repoint what is already enabled
+# ---------------------------------------------------------------------------
+reenable_third_party: true

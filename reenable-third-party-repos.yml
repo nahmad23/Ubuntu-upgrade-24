@@ -50,6 +50,22 @@
     fix_quoted_uris: true
     sources_dir: /etc/apt/sources.list.d
 
+    # Source files that must NOT have their codename rewritten, as regexes
+    # matched against the file path. Some vendors pin the old codename into
+    # the repository PATH as part of a build identifier — e.g.
+    #   deb http://mirror.example.com/apt/fluentbit/jammy-4.0.0 ./
+    # where there is no "noble-4.0.0" to move to. Rewriting those silently
+    # points the host at a URL that does not exist. There is no safe way to
+    # tell these apart automatically: "jammy-4.0.0" and "jammy-updates" are
+    # the same shape, and one must be rewritten while the other must not.
+    codename_rewrite_exclude: []
+
+    # Repositories that must be present and resolving once this playbook has
+    # run, as "SITE SUITE" substrings matched against `apt-get indextargets`.
+    # Use it to hold upgraded hosts to a known-good 24.04 repository set.
+    # Empty disables the check.
+    expected_repos: []
+
     # Lines that mean a repository is genuinely unusable. apt reports a real
     # signing failure as "E: The repository ... is not signed", so ^E: covers
     # the unverifiable case without having to guess at wordings.
@@ -180,9 +196,33 @@
     # would leave a duplicate and rewrite it twice.
     - name: Build the list of files to repoint at {{ new_codename }}
       ansible.builtin.set_fact:
-        rewrite_targets: >-
+        rewrite_candidates: >-
           {{ (reenabled_files + (stale_codename_files.files | default([])))
              | map(attribute='path') | unique | list }}
+
+    - name: Hold back the sources excluded from the codename rewrite
+      ansible.builtin.set_fact:
+        rewrite_targets: >-
+          {{ rewrite_candidates
+             if (codename_rewrite_exclude | length == 0)
+             else (rewrite_candidates
+                   | reject('search', codename_rewrite_exclude | join('|'))
+                   | list) }}
+        rewrite_skipped: >-
+          {{ []
+             if (codename_rewrite_exclude | length == 0)
+             else (rewrite_candidates
+                   | select('search', codename_rewrite_exclude | join('|'))
+                   | list) }}
+
+    - name: Report sources deliberately kept on {{ old_codename }}
+      ansible.builtin.debug:
+        msg: |
+          These sources match codename_rewrite_exclude and keep their
+          {{ old_codename }} path — a vendor that pins the codename into the
+          repository URL usually has no {{ new_codename }} equivalent:
+            {{ rewrite_skipped | join(', ') }}
+      when: rewrite_skipped | length > 0
 
     - name: Rewrite suite {{ old_codename }} -> {{ new_codename }}
       ansible.builtin.replace:
@@ -326,8 +366,59 @@
         or apt_update.rc != 0
         or (fail_on_apt_warnings | bool and warned_repos | length > 0)
 
+    # -------------------------------------------------------------------
+    # Hold the host to a known-good repository set
+    # -------------------------------------------------------------------
+    # apt-get indextargets reports what apt is actually configured against,
+    # which is the honest answer — it reflects the merged effect of
+    # sources.list, sources.list.d and any deb822 stanzas, rather than what
+    # the files look like.
+    - name: Enumerate the repositories apt is configured against
+      ansible.builtin.shell:
+        cmd: |
+          apt-get indextargets --no-release-info --format '$(SITE) $(RELEASE)' \
+            | sort -u
+        executable: /bin/bash
+      register: configured_repos
+      changed_when: false
+      failed_when: false
+      when: expected_repos | length > 0
+
+    - name: Work out which expected repositories are missing
+      ansible.builtin.set_fact:
+        missing_repos: >-
+          {{ expected_repos | reject('in', configured_repos.stdout | default(''))
+             | list }}
+      when: expected_repos | length > 0
+
+    - name: Show the repositories apt is configured against
+      ansible.builtin.debug:
+        var: configured_repos.stdout_lines
+      when: expected_repos | length > 0
+
+    # Double-quoted scalars so \n is a real newline; inside the literal block
+    # below it would stay a backslash-n.
+    - name: Render the repository comparison
+      ansible.builtin.set_fact:
+        missing_repos_text: "{{ missing_repos | default([]) | join('\n  ') }}"
+        configured_repos_text: "{{ configured_repos.stdout_lines | default([]) | join('\n  ') }}"
+      when: expected_repos | length > 0
+
+    - name: Fail if the host does not match the expected repository set
+      ansible.builtin.fail:
+        msg: |
+          {{ inventory_hostname }} is missing repositories that the expected
+          24.04 set requires:
+            {{ missing_repos_text }}
+          Configured instead:
+            {{ configured_repos_text }}
+      when:
+        - expected_repos | length > 0
+        - missing_repos | length > 0
+
     - name: Report success
       ansible.builtin.debug:
         msg: >-
           All APT repositories on {{ inventory_hostname }} are enabled and
-          resolving for {{ new_codename }}.
+          resolving{{ ' and match the expected set'
+                      if (expected_repos | length > 0) else '' }}.

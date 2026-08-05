@@ -1,3 +1,4 @@
 # Written by ansible.cfg (log_path); a per-run artifact, not source.
 ansible-upgrade.log
 *.retry
+vars/site-repos.yml

@@ -159,6 +159,36 @@ ansible-playbook reenable-third-party-repos.yml
 ansible-playbook reenable-third-party-repos.yml -e repo_batch=25%
 ```
 
+### Matching a known-good 24.04 repository set
+
+Build the target from a server already running 24.04 correctly:
+
+```bash
+apt-get indextargets --no-release-info --format '$(SITE) $(RELEASE)' | sort -u
+```
+
+Then copy `vars/site-repos.yml.example` to `vars/site-repos.yml` (gitignored,
+because it names your internal mirrors), fill it in, and pass it:
+
+```bash
+ansible-playbook reenable-third-party-repos.yml -e @vars/site-repos.yml
+```
+
+It controls two things that a codename rewrite alone cannot get right:
+
+- **`codename_rewrite_exclude`** — sources whose codename must be left alone.
+  Some vendors pin the codename into the repository *path* as a build
+  identifier, e.g. `…/apt/fluentbit/jammy-4.0.0 ./`, where no `noble-4.0.0`
+  exists; 24.04 hosts keep using the jammy-named path. This cannot be
+  detected automatically — `jammy-4.0.0` and `jammy-updates` are the same
+  shape, and one must be left alone while the other must be rewritten. Worse,
+  a flat repo (`./`) that 404s shows up as `Ign:` rather than an error, so
+  getting it wrong fails **silently**.
+- **`expected_repos`** — the repository set an upgraded host must end up with.
+  Checked against `apt-get indextargets` after the run, so it reflects what
+  apt is actually configured against rather than what the files look like. A
+  host missing any entry fails the play.
+
 ### Leaving third-party repos disabled
 
 If you would rather **not** switch the vendor repos back on, and only need the
