@@ -135,9 +135,13 @@
     # thing that gets lost, so check rather than assume.
     - name: Collect the keyring paths the deployed sources reference
       ansible.builtin.set_fact:
+        # Joined with a space, not '\n': this has to stay a folded scalar so
+        # the regex keeps its \s, \t and \] escapes, and in a folded scalar
+        # '\n' would be a literal backslash-n — which the path pattern would
+        # then swallow into the match. A space terminates the path cleanly.
         referenced_keyrings: >-
           {{ desired_apt_sources
-             | map(attribute='content') | join('\n')
+             | map(attribute='content') | join(' ')
              | regex_findall('(?:signed-by=|Signed-By:[ \t]*)(/[^\s\]]+)')
              | unique | list }}
 
