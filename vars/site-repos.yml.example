@@ -133,3 +133,26 @@ desired_apt_sources:
       URIs: http://mirror.example.com/apt/zabbix-6.0
       Suites: noble
       Components: main
+
+# ---------------------------------------------------------------------------
+# 5. Signing keys the sources depend on.
+#
+# A source with signed-by=/usr/share/keyrings/x.gpg needs that file to exist
+# AND to contain the right key. A release upgrade can lose it, and the symptom
+# is NO_PUBKEY followed by "The repository ... is not signed" — apt then
+# refuses the repository outright.
+#
+# Take the keyrings from a host where apt-get update is clean:
+#
+#   mkdir -p files/keyrings
+#   ssh root@<good-host> 'base64 /usr/share/keyrings/hashicorp-archive-keyring.gpg' \
+#     | base64 -d > files/keyrings/hashicorp-archive-keyring.gpg
+#
+# Each entry needs a path plus ONE of `src` (a file on the control node) or
+# `armored` (ASCII-armored key text, dearmoured on the target).
+# ---------------------------------------------------------------------------
+desired_apt_keyrings: []
+#   - path: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+#     src: files/keyrings/hashicorp-archive-keyring.gpg
+#   - path: /usr/share/keyrings/ansible-archive-keyring.gpg
+#     src: files/keyrings/ansible-archive-keyring.gpg

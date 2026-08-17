@@ -43,6 +43,14 @@
     backup_dir: /var/backups/apt-sources
 
     expected_repos: []
+
+    # Signing keys the sources depend on. Each entry needs a path plus ONE of:
+    #   armored: |   ASCII-armored key text, dearmoured on the target
+    #   src: <file>  a binary keyring file on the control node
+    # Without these, a host that lost a key during the upgrade gets NO_PUBKEY
+    # and apt refuses the repository outright.
+    desired_apt_keyrings: []
+
     apt_error_patterns:
       - '^Err:'
       - '^E: '
@@ -145,25 +153,101 @@
              | regex_findall('(?:signed-by=|Signed-By:[ \t]*)(/[^\s\]]+)')
              | unique | list }}
 
-    - name: Check each referenced keyring exists
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      loop: "{{ referenced_keyrings }}"
-      register: keyring_stat
+    # Deploying the sources without the keys leaves the host with repositories
+    # it cannot verify — NO_PUBKEY, and apt refuses to use them. A release
+    # upgrade is exactly when a key goes missing, so ship the keys with the
+    # sources rather than assuming the host still has them.
+    - name: Ensure the keyring directory exists
+      ansible.builtin.file:
+        path: /usr/share/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: desired_apt_keyrings | length > 0
 
-    - name: Fail if a source names a keyring the host does not have
+    - name: Deploy keyrings supplied as files on the control node
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.path }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ desired_apt_keyrings | selectattr('src', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # apt needs a binary keyring, so armored text has to be dearmored on the
+    # target. gpg --dearmor is deterministic, so writing only when the result
+    # differs keeps the task idempotent.
+    - name: Stage armored keys for dearmouring
+      ansible.builtin.copy:
+        dest: "/tmp/.apt-key-{{ item.path | basename }}.asc"
+        content: "{{ item.armored }}"
+        owner: root
+        group: root
+        mode: '0600'
+      loop: "{{ desired_apt_keyrings | selectattr('armored', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: staged_keys
+      # The dearmour step below deletes this staging file, so copy would
+      # otherwise report a change on every run for a temporary artefact.
+      changed_when: false
+
+    - name: Dearmour staged keys into place
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          src="/tmp/.apt-key-$(basename '{{ item.path }}').asc"
+          tmp="$(mktemp)"
+          gpg --batch --yes --dearmor -o "$tmp" "$src"
+          if ! cmp -s "$tmp" '{{ item.path }}' 2>/dev/null; then
+            install -o root -g root -m 0644 "$tmp" '{{ item.path }}'
+            echo CHANGED
+          fi
+          rm -f "$tmp" "$src"
+        executable: /bin/bash
+      loop: "{{ desired_apt_keyrings | selectattr('armored', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: dearmoured
+      changed_when: "'CHANGED' in (dearmoured.stdout | default(''))"
+
+    # Existence is not enough: a zero-length or truncated keyring satisfies a
+    # stat check and still produces NO_PUBKEY. Ask gpg whether it can actually
+    # read a key out of each one.
+    - name: Verify every referenced keyring holds a usable key
+      ansible.builtin.shell:
+        cmd: |
+          if [ ! -s '{{ item }}' ]; then
+            echo "MISSING-OR-EMPTY"
+          elif gpg --show-keys --with-colons '{{ item }}' 2>/dev/null | grep -q '^pub'; then
+            echo "OK"
+          else
+            echo "UNREADABLE"
+          fi
+        executable: /bin/bash
+      loop: "{{ referenced_keyrings }}"
+      register: keyring_check
+      changed_when: false
+
+    - name: Fail if a source names a keyring the host cannot use
       ansible.builtin.assert:
         that:
-          - keyring_stat.results | rejectattr('stat.exists') | list | length == 0
+          - keyring_check.results | rejectattr('stdout', 'search', 'OK')
+            | list | length == 0
         fail_msg: >-
-          These sources reference keyrings that do not exist on
-          {{ inventory_hostname }}, so those repositories cannot be verified:
-          {{ keyring_stat.results | rejectattr('stat.exists')
+          These keyrings are missing, empty or unreadable on
+          {{ inventory_hostname }}, so the repositories that reference them
+          will fail with NO_PUBKEY:
+          {{ keyring_check.results | rejectattr('stdout', 'search', 'OK')
              | map(attribute='item') | list | join(', ') }}.
-          Copy the keyring across from a working host, or switch the entry to
-          an inline deb822 Signed-By key.
+          Add them to desired_apt_keyrings, or copy them across from a host
+          where apt-get update is clean.
         success_msg: >-
-          All {{ referenced_keyrings | length }} referenced keyring(s) present.
+          All {{ referenced_keyrings | length }} referenced keyring(s) hold a
+          usable key.
       when: referenced_keyrings | length > 0
 
     # -------------------------------------------------------------------
