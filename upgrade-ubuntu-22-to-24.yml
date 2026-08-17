@@ -59,6 +59,7 @@
     fail_on_held_packages: true          # held packages make the upgrader bail
     check_upgrade_tool_reachable: true   # verify archive.ubuntu.com is allowed
     merge_usr: true                      # 24.04 refuses an unmerged /usr
+    fail_on_cleanup_errors: false        # post-upgrade tidy-up is not the upgrade
     archive_check_url: ''                # empty => derive from the host's mirror
     archive_check_timeout: 15
 
@@ -607,14 +608,74 @@
         # ---------------------------------------------------------------
         # STEP 5 — Post-upgrade cleanup
         # ---------------------------------------------------------------
-        - name: Remove packages left over from the old release
-          ansible.builtin.apt:
-            update_cache: true
-            autoremove: true
-            autoclean: true
-            purge: true
-            dpkg_options: 'force-confdef,force-confold'
+        # By this point the host has already rebooted into 24.04, been
+        # verified, and passed dpkg --audit. Tidying up obsolete packages is
+        # housekeeping, not part of the upgrade succeeding — and it is the
+        # step most likely to trip on something outside our control, because
+        # removing an obsolete vendor package runs that vendor's prerm
+        # script. Monitoring and security agents are frequent offenders.
+        #
+        # Failing the host here reports a successful upgrade as a failure,
+        # so these steps are tolerant and reported rather than fatal. Set
+        # -e fail_on_cleanup_errors=true to restore strict behaviour.
+        - name: Refresh the apt cache after the upgrade
+          ansible.builtin.command:
+            cmd: apt-get update
           environment: "{{ apt_noninteractive_env }}"
+          register: post_apt_update
+          changed_when: true
+          failed_when: false
+
+        - name: Remove packages left over from the old release
+          ansible.builtin.command:
+            cmd: apt-get -y autoremove --purge
+          environment: "{{ apt_noninteractive_env }}"
+          register: post_autoremove
+          changed_when: "'Removing ' in (post_autoremove.stdout | default(''))"
+          failed_when: false
+
+        - name: Clean obsolete files from the package cache
+          ansible.builtin.command:
+            cmd: apt-get -y autoclean
+          environment: "{{ apt_noninteractive_env }}"
+          register: post_autoclean
+          changed_when: false
+          failed_when: false
+
+        - name: Record whether cleanup hit any problems
+          ansible.builtin.set_fact:
+            cleanup_failed: >-
+              {{ (post_apt_update.rc | default(0)) != 0
+                 or (post_autoremove.rc | default(0)) != 0
+                 or (post_autoclean.rc | default(0)) != 0 }}
+            cleanup_error_text: "{{ ((post_apt_update.stderr_lines | default([]))
+                                     + (post_autoremove.stderr_lines | default([]))
+                                     + (post_autoclean.stderr_lines | default([])))[-15:]
+                                    | join('\n  ') }}"
+
+        - name: Report cleanup problems without failing the host
+          ansible.builtin.debug:
+            msg: |
+              Post-upgrade cleanup did not fully succeed on {{ inventory_hostname }}.
+              The upgrade itself is COMPLETE and verified — this step is
+              housekeeping only, and the host is usable.
+                apt-get update            rc={{ post_apt_update.rc | default('n/a') }}
+                apt-get autoremove --purge rc={{ post_autoremove.rc | default('n/a') }}
+                apt-get autoclean         rc={{ post_autoclean.rc | default('n/a') }}
+              Last error output:
+                {{ cleanup_error_text }}
+              Re-run 'apt-get -y autoremove --purge' by hand once the
+              third-party repositories have been restored.
+          when: cleanup_failed | bool
+
+        - name: Fail on cleanup problems when strict mode is requested
+          ansible.builtin.fail:
+            msg: >-
+              Post-upgrade cleanup failed on {{ inventory_hostname }} and
+              fail_on_cleanup_errors is true. See the report above.
+          when:
+            - cleanup_failed | bool
+            - fail_on_cleanup_errors | bool
 
         - name: Check whether a final reboot is required
           ansible.builtin.stat:
@@ -635,10 +696,26 @@
               (kernel {{ ansible_kernel }})
 
       rescue:
-        # An async job that ran out of time comes back with no rc at all, and
-        # that is a completely different problem from the upgrader exiting
-        # non-zero — one means "too slow", the other means "it refused".
-        # Say which, rather than making the operator guess.
+        # Which task actually failed decides what is worth reporting. Any
+        # failure used to be reported as a do-release-upgrade failure and
+        # answered with a dump of main.log — so a post-upgrade housekeeping
+        # error came back describing an upgrade that had in fact succeeded,
+        # buried under eighty lines of an unrelated log.
+        - name: Record which task failed
+          ansible.builtin.set_fact:
+            failed_task_name: "{{ ansible_failed_task.name | default('unknown') }}"
+            release_upgrade_was_the_failure: >-
+              {{ 'do-release-upgrade' in (ansible_failed_task.name | default('')) }}
+
+        # The real error, first and unconditionally. Whatever went wrong,
+        # this is the line that explains it.
+        - name: Show the actual error from the failed task
+          ansible.builtin.debug:
+            msg: |
+              Task that failed: {{ failed_task_name }}
+              Error: {{ ansible_failed_result.msg | default('(no message)') }}
+              {{ (ansible_failed_result.stderr | default('')) | trim }}
+
         # raw runs over the shell and needs no python on the target, so it
         # still answers when a broken interpreter is the reason we are here.
         - name: Check which release the host is actually running now
@@ -680,6 +757,7 @@
           register: upgrade_log
           changed_when: false
           failed_when: false
+          when: release_upgrade_was_the_failure | bool
 
         # An empty stdout from do-release-upgrade is normal — the
         # non-interactive frontend logs to main.log instead of the terminal —
@@ -693,17 +771,20 @@
               log=/var/log/dist-upgrade/main.log
               [ -f "$log" ] || { echo "no main.log — the upgrader never started"; exit 0; }
               echo "main.log last modified: $(date -r "$log" '+%Y-%m-%d %H:%M:%S') (now $(date '+%Y-%m-%d %H:%M:%S'))"
-              grep -iE 'error|exception|traceback|unresolvable|not authenticated|failed to|no space|aborting' \
-                "$log" | tail -n 25
+              grep -aE ' (ERROR|CRITICAL) |Traceback|unresolvable|Cannot upgrade|No space left' \
+                "$log" | tail -n 25 | cut -c1-300
             executable: /bin/bash
           register: upgrade_errors
           changed_when: false
           failed_when: false
+          when: release_upgrade_was_the_failure | bool
 
         - name: Show the errors found in the upgrader log
           ansible.builtin.debug:
             var: upgrade_errors.stdout_lines
-          when: upgrade_errors.stdout | default('') | trim | length > 0
+          when:
+            - release_upgrade_was_the_failure | bool
+            - upgrade_errors.stdout | default('') | trim | length > 0
 
         # On a fleet run the per-host output scrolls past; leave every failed
         # host's log on the controller under ./dist-upgrade-logs/<host>/.
@@ -732,20 +813,24 @@
         # collapses onto one unreadable line.
         - name: Assemble the diagnostic report
           ansible.builtin.set_fact:
-            upgrade_error_text: "{{ (upgrade_errors.stdout_lines | default([]))
-                                    | join('\n') }}"
-            upgrade_tail_text: "{{ (upgrade_log.stdout_lines | default([]))[-30:]
-                                   | join('\n') }}"
+            failed_error_text: "{{ (ansible_failed_result.msg | default('(no message)')) ~ '\n' ~
+                                   ((ansible_failed_result.stderr | default('')) | trim) }}"
+            upgrade_error_text: "{{ (upgrade_errors.stdout_lines | default([])) | join('\n') }}"
+            upgrade_tail_text: "{{ (upgrade_log.stdout_lines | default([]))[-30:] | join('\n') }}"
 
-        # The diagnosis goes in the failure message itself, not in a separate
-        # task. do-release-upgrade's own stdout is always empty under the
-        # non-interactive frontend, so without this the fatal output an
-        # operator sees and pastes contains nothing actionable at all.
-        - name: Fail the host after reporting the upgrade error
+        # Two shapes of report, because two very different things can fail.
+        #
+        # If do-release-upgrade failed, its own stdout is empty by design and
+        # main.log holds the answer, so that goes in the message.
+        #
+        # If anything else failed — the host is already upgraded and verified
+        # by then — main.log describes an upgrade that SUCCEEDED and is pure
+        # noise. Report the failing task's own error instead.
+        - name: Fail the host after reporting the release upgrade error
           ansible.builtin.fail:
             msg: |-
-              Upgrade failed on {{ inventory_hostname }} at task
-              "{{ ansible_failed_task.name | default('unknown') }}".
+              Release upgrade failed on {{ inventory_hostname }} at task
+              "{{ failed_task_name }}".
 
               do-release-upgrade writes nothing to stdout under
               DistUpgradeViewNonInteractive; everything below comes from
@@ -759,6 +844,23 @@
               {{ upgrade_tail_text | default('', true) | trim
                  | default('(main.log absent — the upgrader never started)', true) }}
               ================================
+          when: release_upgrade_was_the_failure | bool
+
+        - name: Fail the host after reporting a post-upgrade error
+          ansible.builtin.fail:
+            msg: |-
+              {{ inventory_hostname }} failed at task "{{ failed_task_name }}".
+
+              This is NOT a do-release-upgrade failure — the release upgrade
+              had already completed by this point, so /var/log/dist-upgrade/
+              describes a successful upgrade and is not shown.
+              The host currently reports Ubuntu
+              {{ raw_release.stdout | default('unknown') | trim }}.
+
+              ===== error from the failed task =====
+              {{ failed_error_text | trim }}
+              ======================================
+          when: not (release_upgrade_was_the_failure | bool)
 
       always:
         # Leaving force-confold in place permanently would silently keep stale
